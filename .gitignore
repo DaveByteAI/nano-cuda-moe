@@ -7,3 +7,5 @@ logs/
 *.sqlite
 *.logits
 __pycache__/
+agent/brain/
+agent/best/
