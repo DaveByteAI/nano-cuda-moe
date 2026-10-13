@@ -211,9 +211,8 @@ def ab(base, cand, model, rounds, prompt_rounds):
     wr = sorted(c / b - 1 for b, c in zip(w["base"], w["cand"]))
     pr = sorted(b / c - 1 for b, c in zip(p["base"], p["cand"]))   # + is faster
     med = lambda v: v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
-    return {"ok": True, "windows": w, "prompt_32k_s": p,
-            "windows_gain": {"median": round(med(wr), 4), "min": round(wr[0], 4), "max": round(wr[-1], 4)},
-            "prompt_gain": {"median": round(med(pr), 4), "min": round(pr[0], 4), "max": round(pr[-1], 4)}}
+    gain = lambda v: {"median": round(med(v), 4), "min": round(v[0], 4), "max": round(v[-1], 4)} if v else None
+    return {"ok": True, "windows": w, "prompt_32k_s": p, "windows_gain": gain(wr), "prompt_gain": gain(pr)}
 
 
 def main():
