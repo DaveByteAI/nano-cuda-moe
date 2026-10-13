@@ -17,7 +17,9 @@ Logs: logs/agent/<time>/ (transcript.jsonl, journal.md, eval-N.json). Python sta
 """
 import argparse
 import json
+import os
 import pathlib
+import re
 import shutil
 import signal
 import subprocess
@@ -37,6 +39,7 @@ EDITABLE = ("src/", "include/")
 # pair slower, the prompt not losing more than LOSS; or the prompt gains >= KEEP with every pair >= 1%, the windows not
 # losing more than LOSS. (One process against another an hour apart differs by up to ~5%: hence the pairs.)
 KEEP, LOSS = 0.03, 0.01
+EARLY = 0.015   # after one round, neither measure this much faster: reverted there (~5 minutes instead of ~13)
 LOOK_NUDGE, LOOK_LIMIT = 15, 25   # read/search/list calls since the last change: a reminder, then no more
 TOOL_OUT_MAX = 12000
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -57,6 +60,8 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "git_diff", "description": "Your changes since the last kept version.",
      "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "profile", "description": "Where the time goes (about 1.5 minutes): a short generation with the engine's stage timers, per decode window: GPU time by stage, the GPU's wait for the CPU experts, the host's CPU expert time, the cache hit rate. 'current' is your build (built first), 'best' the last kept one: compare them to see what a change moved.",
+     "parameters": {"type": "object", "properties": {"which": {"type": "string", "enum": ["current", "best"], "description": "default current"}}}}},
     {"type": "function", "function": {"name": "evaluate", "description": "Judge the current changes with the examiner (2-4 minutes): correctness gate, then speed. Kept if faster, otherwise reverted.",
      "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "one line: what you changed and why it should be faster"}}, "required": ["summary"]}}},
     {"type": "function", "function": {"name": "finish", "description": "Stop working.",
@@ -180,13 +185,17 @@ class Agent:
         (self.logs / f"eval-{self.n_eval + 1}.patch").write_text(diff)   # kept or not, for a human to look at later
         self.brain.stop()
         try:
-            r = self.examine(extra=["--base", str(self.best_dir)])
+            r = self.examine(extra=["--base", str(self.best_dir), "--early", str(EARLY)])
         finally:
             self.brain.start()
         keep, why, ab = False, "", r.get("ab", {})
         if r.get("verdict") != "pass":
             why = "failed: " + ("build" if not r.get("build", {}).get("ok") else
                                 "correctness gate" if not r.get("correct", {}).get("ok") else "measurement run")
+        elif ab.get("stopped_early"):
+            w, p = ab["windows_gain"], ab["prompt_gain"]
+            why = f"not promising after one round: windows {w['median']:+.1%}, 32K prompt {p['median']:+.1%} " \
+                  f"(continued only when one gains >= {EARLY:.1%})"
         else:
             w, p = ab["windows_gain"], ab["prompt_gain"]
             keep = (w["median"] >= KEEP and w["min"] >= 0 and p["median"] > -LOSS) or \
@@ -216,6 +225,49 @@ class Agent:
             brief["details"] = {k: r[k] for k in ("build", "correct", "ab", "error") if k in r}
         if not keep: brief["note"] = "the worktree is back at the last kept version"
         return clip(json.dumps(brief, ensure_ascii=False, indent=1))
+
+    # ---- profiling
+    PROFILE_TEXTS = ("code_cuda", "en_docs")   # two corpus texts with a lowish hit rate: CPU experts show
+
+    def profile(self, which):
+        """a short generation with BL_STAGE_PROF=1, averaged over its windows into one table"""
+        if which == "best":
+            binary = self.best_dir / "build" / "bl-run"
+        else:
+            r = examiner.build(self.work, jobs=4)
+            if not r["ok"]: return "build FAILED:\n" + r["log"]
+            binary = self.work / "build" / "bl-run"
+        cmd = [str(binary), "--model", str(MODEL), "--ctx", "8192", "--gen", "120", "--spec", "3", "--no-prepass"]
+        for t in self.PROFILE_TEXTS: cmd += ["--tokens-file", str(ROOT / "bench" / "corpus" / f"{t}.tokens")]
+        self.brain.stop()
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env={**os.environ, "BL_STAGE_PROF": "1"})
+        finally:
+            self.brain.start()
+        out = p.stdout
+        win = [(int(a), int(b), float(c), float(d), float(e)) for a, b, c, d, e in re.findall(
+            r"(\d+) windows, (\d+) tokens: ([\d.]+) ms per window; host: [\d.]+ ms PLE rows, [\d.]+ ms graph launch, "
+            r"([\d.]+) ms waiting for doorbells, ([\d.]+) ms computing CPU experts", out)]
+        stages = [dict((k.strip(), float(v)) for k, v in re.findall(r"([a-zA-Z+() ]+?) ([\d.]+)(?:,|$)", line.split(":", 1)[1].split(" total")[0]))
+                  for line in re.findall(r"^GPU stages per window \(ms\):.*$", out, re.M)]
+        hits = [float(h) for h in re.findall(r"hit rate ([\d.]+)%", out)]
+        per_round = [float(x) for x in re.findall(r"MTP: \d+ rounds, ([\d.]+) tokens per round", out)]   # (the window count above includes the prompt's tokens)
+        if p.returncode or len(win) != len(self.PROFILE_TEXTS) or len(stages) != len(win):
+            return "profile run FAILED:\n" + clip("\n".join((out + p.stderr).splitlines()[-30:]), 3000)
+        n = sum(w[0] for w in win)
+        avg = lambda vals: sum(v * w[0] for v, w in zip(vals, win)) / n
+        lines = [f"profile of the {which} build: {n} decode windows, "
+                 f"{avg(per_round) if len(per_round) == len(win) else float('nan'):.2f} tokens per window (MTP), cache hit rate {avg(hits):.1f}%",
+                 f"wall time per window: {avg([w[2] for w in win]):.2f} ms",
+                 "GPU time per window by stage (ms):"]
+        for k in stages[0]:
+            lines.append(f"  {k:16s} {avg([st.get(k, 0.0) for st in stages]):6.2f}")
+        lines.append(f"  {'total':16s} {avg([sum(st.values()) for st in stages]):6.2f}")
+        lines.append(f"host per window: {avg([w[4] for w in win]):.2f} ms computing CPU experts, "
+                     f"{avg([w[3] for w in win]):.2f} ms waiting for the GPU's doorbells")
+        lines.append("('wait (CPU)' is the GPU spinning for the CPU experts' results; a change shows as stages moving. "
+                     "Free generation: tokens per window and hit rate vary a little between runs.)")
+        return "\n".join(lines)
 
     # ---- the tools
     def path(self, rel, write=False):
@@ -270,6 +322,8 @@ class Agent:
             if name == "git_diff":
                 rc, out = sh(["git", "-C", str(self.work), "diff"])
                 return clip(out) or "no changes"
+            if name == "profile":
+                return self.profile(args.get("which", "current") if args.get("which") in ("current", "best") else "current")
             if name == "evaluate":
                 if self.n_eval >= self.a.max_evals: return "error: no evaluations left; call finish"
                 return self.judge(args.get("summary", "(no summary)"))

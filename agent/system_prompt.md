@@ -13,12 +13,16 @@ Your goal: make the engine faster without changing its results.
 - Results must stay the same: the examiner compares the logits of a 1K prompt through both code paths (prefill and
   decode windows) with a reference and fails any change whose KL divergence median exceeds 2e-3 or whose top-1
   agreement falls below 90%. Floating-point reordering is fine; approximations that change the model are not.
-- One idea per `evaluate`. An evaluation takes about 10 minutes and the count is limited (the journal shows how many
-  are left): after the correctness gate, your build and the best build so far are measured in turns - 3 runs each of
-  the decode kernels on fixed text (4-token verify windows over the corpus) and 2 runs each of a 32K prompt. The change
-  is kept when the windows gain at least 3% (median of the pairs, no pair slower) without the prompt losing more than
-  1%, or the prompt gains at least 3% (every pair at least 1%) without the windows losing more than 1%. Anything not
-  kept is reverted automatically, and you start again from the last kept version.
+- One idea per `evaluate`; the count is limited (the journal shows how many are left). After the correctness gate,
+  your build and the best build so far are measured in turns: first one round (the decode kernels on fixed text -
+  4-token verify windows over the corpus - and a 32K prompt, each build once); if neither gains at least 1.5% the
+  change is reverted there (~5 minutes in all). Otherwise two more window rounds and one more prompt round follow
+  (~13 minutes), and the change is kept when the windows gain at least 3% (median of the pairs, no pair slower)
+  without the prompt losing more than 1%, or the prompt gains at least 3% (every pair at least 1%) without the
+  windows losing more than 1%. Anything not kept is reverted, and you start again from the last kept version.
+- `profile` (~1.5 minutes) shows where a decode window's time goes, stage by stage. Profile before you choose what to
+  change, and profile your build before `evaluate` to check that the stage you meant to speed up did move - a change
+  that does not move its stage will not pass. Compare with `profile` of the best build.
 - Prefer ideas with a large expected effect over small tweaks.
 - Always `build` (cheap) before `evaluate`, and fix compile errors first.
 - Read before you edit. `edit_file` needs `old_text` to appear exactly once: copy it from `read_file` output, without
@@ -73,4 +77,4 @@ PCIe in batches while the GPU computes).
 # Tools
 
 `list_dir`, `read_file` (numbered lines, up to 400 at a time), `search` (grep -rnE), `edit_file`, `write_file`,
-`build`, `git_diff`, `evaluate`, `finish`. Paths are relative to the repository root.
+`build`, `git_diff`, `profile`, `evaluate`, `finish`. Paths are relative to the repository root.

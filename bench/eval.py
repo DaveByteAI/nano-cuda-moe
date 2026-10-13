@@ -192,7 +192,7 @@ def prompt32(binary, model):
     return float(rows[-1][1])
 
 
-def ab(base, cand, model, rounds, prompt_rounds):
+def ab(base, cand, model, rounds, prompt_rounds, early=None):
     """the base build and the candidate measured in turns, the order swapped every round (the machine drifts: one process
     against another an hour apart differs by up to ~5% on the windows); per pair, candidate / base"""
     w = {"base": [], "cand": []}
@@ -208,6 +208,13 @@ def ab(base, cand, model, rounds, prompt_rounds):
                 t = prompt32(bins[who], model)
                 if t is None: return {"ok": False, "who": who, "log": "the 32K prompt run failed"}
                 p[who].append(t)
+        if r == 0 and early is not None:   # one round in: not promising when neither measure gains `early`
+            g_w = w["cand"][0] / w["base"][0] - 1
+            g_p = p["base"][0] / p["cand"][0] - 1 if p["cand"] else -1.0
+            if g_w < early and g_p < early:
+                one = lambda g: {"median": round(g, 4), "min": round(g, 4), "max": round(g, 4)}
+                return {"ok": True, "stopped_early": True, "windows": w, "prompt_32k_s": p,
+                        "windows_gain": one(g_w), "prompt_gain": one(g_p) if p["cand"] else None}
     wr = sorted(c / b - 1 for b, c in zip(w["base"], w["cand"]))
     pr = sorted(b / c - 1 for b, c in zip(p["base"], p["cand"]))   # + is faster
     med = lambda v: v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
@@ -228,6 +235,7 @@ def main():
     ap.add_argument("--rounds", type=int, default=3, help="A/B: window runs of each")
     ap.add_argument("--prompt-rounds", type=int, default=2, help="A/B: 32K prompt runs of each")
     ap.add_argument("--no-speed", action="store_true", help="build and correctness only")
+    ap.add_argument("--early", type=float, help="A/B: stop after one round when neither measure gains this much (e.g. 0.015)")
     a = ap.parse_args()
     repo, ref = pathlib.Path(a.repo).resolve(), pathlib.Path(a.ref)
     if subprocess.run(["pgrep", "-x", "bl-server"], capture_output=True).returncode == 0:
@@ -245,7 +253,7 @@ def main():
         report["correct"] = correctness(binary, a.model, None if a.make_ref else ref, ref if a.make_ref else work)
         if report["correct"]["ok"]:
             if a.base:
-                report["ab"] = ab(pathlib.Path(a.base) / "build" / "bl-run", binary, a.model, a.rounds, a.prompt_rounds)
+                report["ab"] = ab(pathlib.Path(a.base) / "build" / "bl-run", binary, a.model, a.rounds, a.prompt_rounds, a.early)
             elif not a.no_speed:
                 report["speed"] = speed_avg(binary, a.model, a.speed_runs)
     measured = report.get("ab", report.get("speed", {"ok": a.no_speed}))
