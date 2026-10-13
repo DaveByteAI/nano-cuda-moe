@@ -3,6 +3,9 @@
 //   POST /v1/chat/completions   messages, stream, temperature, top_p, top_k, max_tokens / max_completion_tokens, seed,
 //                               reasoning_effort, chat_template_kwargs.enable_thinking; non-standard: spec (MTP drafts)
 //   GET  /health
+// Function calling: "tools" go into the model's template; the model's <tool_call> blocks come back as "tool_calls"
+// (finish_reason "tool_calls"; streamed, the text before them streams and the calls come in one delta at the end), and
+// assistant turns with "tool_calls" and "tool" messages are written back the template's way.
 // Thinking is off unless the request asks (enable_thinking: true or a reasoning_effort); the thinking comes back as
 // reasoning_content. The engine keeps the conversation between requests: a request that continues it (the same
 // messages plus new ones) only feeds the new part.
@@ -85,6 +88,66 @@ std::vector<ModelFile> list_models(const std::string & shard1) {
     closedir(d);
     std::sort(r.begin(), r.end(), [](const ModelFile & a, const ModelFile & b) { return a.id < b.id; });
     return r;
+}
+
+// JSON as the template's tojson writes it (Python's json.dumps: ", " and ": " between items, no ASCII escaping)
+std::string py_json(const json & v) {
+    if (v.is_object()) {
+        std::string s = "{";
+        for (auto it = v.begin(); it != v.end(); ++it) s += (it == v.begin() ? "" : ", ") + json(it.key()).dump() + ": " + py_json(it.value());
+        return s + "}";
+    }
+    if (v.is_array()) {
+        std::string s = "[";
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + py_json(v[i]);
+        return s + "]";
+    }
+    return v.dump();
+}
+
+std::string trim_ws(const std::string & s) {
+    const auto b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    return b == std::string::npos ? "" : s.substr(b, e - b + 1);
+}
+
+// the answer split into its text and its <tool_call> blocks, as OpenAI tool_calls; a parameter's value is a string
+// when the tool's schema says so (or it is not JSON), else the JSON it holds
+struct Answer { std::string content; json calls = json::array(); };
+Answer split_tool_calls(const std::string & text, const json & tools, const std::string & id_prefix) {
+    Answer a;
+    size_t at = text.find("<tool_call>");
+    a.content = trim_ws(text.substr(0, at));
+    while (at != std::string::npos) {
+        const size_t end = text.find("</tool_call>", at);
+        const std::string blk = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        const size_t f = blk.find("<function=");
+        if (f != std::string::npos) {
+            const size_t fe = blk.find('>', f);
+            const std::string name = trim_ws(blk.substr(f + 10, fe - f - 10));
+            json props = json::object();
+            for (const auto & t : tools) {
+                const json & fn = t.contains("function") ? t["function"] : t;
+                if (fn.value("name", "") == name && fn.contains("parameters")) props = fn["parameters"].value("properties", json::object());
+            }
+            json args = json::object();
+            for (size_t p = blk.find("<parameter=", fe); p != std::string::npos; p = blk.find("<parameter=", p + 1)) {
+                const size_t pe = blk.find('>', p), ve = blk.find("</parameter>", pe);
+                if (pe == std::string::npos) break;
+                const std::string key = trim_ws(blk.substr(p + 11, pe - p - 11));
+                std::string val = blk.substr(pe + 1, ve == std::string::npos ? std::string::npos : ve - pe - 1);
+                if (!val.empty() && val.front() == '\n') val.erase(0, 1);
+                if (!val.empty() && val.back() == '\n') val.pop_back();
+                const bool as_string = props.contains(key) && props[key].value("type", "") == "string";
+                json v = val;
+                if (!as_string) try { v = json::parse(val); } catch (...) { v = val; }
+                args[key] = v;
+            }
+            a.calls.push_back({{"id", id_prefix + std::to_string(a.calls.size())}, {"type", "function"},
+                               {"function", {{"name", name}, {"arguments", args.dump()}}}});
+        }
+        at = end == std::string::npos ? std::string::npos : text.find("<tool_call>", end);
+    }
+    return a;
 }
 
 json error_json(const std::string & msg, const std::string & type = "invalid_request_error") {
@@ -221,8 +284,23 @@ int main(int argc, char ** argv) {
         std::vector<bl::Text::Message> msgs;
         bl::ChatParams cp;
         try {
-            for (const auto & m : body.at("messages"))
-                msgs.push_back({m.at("role").get<std::string>(), content_text(m.value("content", json(""))), m.value("reasoning_content", std::string())});
+            for (const auto & m : body.at("messages")) {
+                bl::Text::Message msg{m.at("role").get<std::string>(), content_text(m.value("content", json(""))),
+                                      m.value("reasoning_content", json("")).is_string() ? m.value("reasoning_content", std::string()) : ""};
+                if (m.contains("tool_calls") && m["tool_calls"].is_array())
+                    for (const auto & tc : m["tool_calls"]) {   // arguments: a JSON string (OpenAI) or an object
+                        const json & fn = tc.contains("function") ? tc["function"] : tc;
+                        bl::Text::ToolCall call{fn.at("name").get<std::string>(), {}};
+                        json args = fn.value("arguments", json::object());
+                        if (args.is_string()) args = trim_ws(args.get<std::string>()).empty() ? json::object() : json::parse(args.get<std::string>());
+                        for (auto it = args.begin(); it != args.end(); ++it)
+                            call.args.push_back({it.key(), it.value().is_string() ? it.value().get<std::string>() : py_json(it.value())});
+                        msg.tool_calls.push_back(std::move(call));
+                    }
+                msgs.push_back(std::move(msg));
+            }
+            if (body.contains("tools") && body["tools"].is_array())
+                for (const auto & t : body["tools"]) cp.tools.push_back(py_json(t));
             cp.sampling.temperature = body.value("temperature", 0.7f);
             cp.sampling.top_p = body.value("top_p", 0.8f);
             cp.sampling.top_k = body.value("top_k", 20);
@@ -239,6 +317,7 @@ int main(int argc, char ** argv) {
             return;
         }
         const bool stream = body.value("stream", false);
+        const json tools = body.value("tools", json::array());
         const std::string id = "chatcmpl-" + std::to_string(++seq);
         const long created = static_cast<long>(std::time(nullptr));
         auto usage = [](const bl::ChatResult & r) {
@@ -251,10 +330,13 @@ int main(int argc, char ** argv) {
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
                 const bl::ChatResult r = cur.chat->reply(msgs, cp);
-                json msg{{"role", "assistant"}, {"content", r.content}};
+                const Answer a = tools.empty() ? Answer{r.content} : split_tool_calls(r.content, tools, "call_" + std::to_string(seq) + "_");
+                json msg{{"role", "assistant"}, {"content", a.content.empty() && !a.calls.empty() ? json(nullptr) : json(a.content)}};
                 if (!r.reasoning.empty()) msg["reasoning_content"] = r.reasoning;
+                if (!a.calls.empty()) msg["tool_calls"] = a.calls;
+                const char * finish = !a.calls.empty() ? "tool_calls" : r.stopped_eog ? "stop" : "length";
                 res.set_content(json{{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", name},
-                                     {"choices", json::array({{{"index", 0}, {"message", msg}, {"finish_reason", r.stopped_eog ? "stop" : "length"}}})},
+                                     {"choices", json::array({{{"index", 0}, {"message", msg}, {"finish_reason", finish}}})},
                                      {"usage", usage(r)}}.dump(), "application/json");
                 std::fprintf(stderr, "%s: %d prompt (+%d reused) in %.2f s, %d tokens at %.1f tok/s\n", id.c_str(), r.n_prompt, r.n_reused,
                              r.prompt_s, r.n_generated, r.gen_s > 0 ? (r.n_generated - 1) / r.gen_s : 0.0);
@@ -265,7 +347,7 @@ int main(int argc, char ** argv) {
             }
             return;
         }
-        res.set_chunked_content_provider("text/event-stream", [&, msgs, cp, id, created, name](size_t, httplib::DataSink & sink) {
+        res.set_chunked_content_provider("text/event-stream", [&, msgs, cp, id, created, name, tools](size_t, httplib::DataSink & sink) {
             std::lock_guard<std::mutex> lk(busy);
             auto send = [&](const json & j) {
                 const std::string s = "data: " + j.dump() + "\n\n";
@@ -278,10 +360,34 @@ int main(int argc, char ** argv) {
             send(chunk({{"role", "assistant"}, {"content", ""}}, nullptr));
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
+                // with tools, the text streams up to a <tool_call> (a tail that could be its start waits); the calls follow at the end
+                static const std::string kTag = "<tool_call>";
+                std::string held;
+                bool in_call = false;
+                auto text_out = [&](const std::string & s) { return s.empty() || send(chunk(json{{"content", s}}, nullptr)); };
                 const bl::ChatResult r = cur.chat->reply(msgs, cp, [&](const std::string & s, bool reasoning) {
-                    return send(chunk(json{{reasoning ? "reasoning_content" : "content", s}}, nullptr));   // false: the client left
+                    if (reasoning) return send(chunk(json{{"reasoning_content", s}}, nullptr));   // false: the client left
+                    if (tools.empty()) return text_out(s);
+                    if (in_call) return true;
+                    held += s;
+                    if (const size_t at = held.find(kTag); at != std::string::npos) {
+                        in_call = true;
+                        return text_out(held.substr(0, at));
+                    }
+                    size_t keep = std::min(held.size(), kTag.size() - 1);
+                    while (keep && held.compare(held.size() - keep, keep, kTag, 0, keep) != 0) --keep;
+                    const std::string out = held.substr(0, held.size() - keep);
+                    held.erase(0, held.size() - keep);
+                    return text_out(out);
                 });
-                json last = chunk(json::object(), r.stopped_eog ? "stop" : "length");
+                if (!in_call) text_out(held);
+                const Answer a = tools.empty() ? Answer{} : split_tool_calls(r.content, tools, "call_" + id.substr(9) + "_");
+                if (!a.calls.empty()) {
+                    json tc = a.calls;
+                    for (size_t i = 0; i < tc.size(); ++i) tc[i]["index"] = static_cast<int>(i);
+                    send(chunk(json{{"tool_calls", tc}}, nullptr));
+                }
+                json last = chunk(json::object(), !a.calls.empty() ? "tool_calls" : r.stopped_eog ? "stop" : "length");
                 last["usage"] = usage(r);
                 send(last);
                 std::fprintf(stderr, "%s (stream): %d prompt (+%d reused) in %.2f s, %d tokens at %.1f tok/s\n", id.c_str(), r.n_prompt,

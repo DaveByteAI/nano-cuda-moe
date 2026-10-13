@@ -17,6 +17,7 @@ struct ChatParams {
     int         spec = 3;            // MTP drafts per round (0: none)
     int         max_new = 4096;
     std::string think;               // "" = no thinking; "low" / "medium" / "xhigh"
+    std::vector<std::string> tools;  // function definitions (JSON each, as the template's tojson writes it)
 };
 
 struct ChatResult {

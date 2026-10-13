@@ -19,7 +19,7 @@ ChatResult Chat::reply(const std::vector<Text::Message> & messages, const ChatPa
                        const std::function<bool(const std::string &, bool)> & on_text) {
     using clock = std::chrono::steady_clock;
     ChatResult res;
-    const std::string rendered = Text::render(messages, true, p.think);
+    const std::string rendered = Text::render(messages, true, p.think, p.tools);
     // the session's text a prefix of the new conversation: feed the rest; else start over
     std::string suffix;
     if (!session_.empty() && rendered.compare(0, session_.size(), session_) == 0 && rendered.size() > session_.size()) {

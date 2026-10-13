@@ -2654,16 +2654,19 @@ struct Engine::Impl : Dev {
         n_cpu += pl.n_cpu;
         n_pf_used += pl.n_pf;
         if (pl.n_dma) cuda::set_flag(dma_flag_hd + il, seq, cp);
-        if (lru) admit(il, pl);
-        if (pf_max > 0 && T == 1 && il + 1 < l1) prefetch_next(il, pl);
         if (nj) {
             const auto tc = std::chrono::steady_clock::now();
             cpu->run(L_.type_gu, L_.type_d, L_.gu_bytes, c.n_ff_exp, D, x_h + static_cast<size_t>(il) * kT * D, T, jobs, nj);
             t_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
             std::atomic_thread_fence(std::memory_order_release);
             _mm_sfence();
-            reinterpret_cast<volatile uint32_t *>(cpu_flag_h)[il] = seq;
+            reinterpret_cast<volatile uint32_t *>(cpu_flag_h)[il] = seq;   // the GPU is spinning for this
         }
+        // the background PCIe work (the LRU admissions, the prefetches) comes after the CPU experts' results: the
+        // GPU is waiting for those, while issuing copies on a busy copy stream can hold the host thread for tens of
+        // microseconds - better spent idle-spinning on the next layer's doorbell than before the CPU's start
+        if (lru) admit(il, pl);
+        if (pf_max > 0 && T == 1 && il + 1 < l1) prefetch_next(il, pl);   // (the next layer on this stage's GPU)
     }
 
     void prefetch_next(int il, const cuda::ExpertPlan & pl) {   // the next layer's likely misses, behind this layer's copies
