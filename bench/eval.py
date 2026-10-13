@@ -122,12 +122,14 @@ def windows(binary, model):
     files = sorted((HERE / "corpus").glob("*.tokens"))
     cmd = [str(binary), "--model", str(model), "--ctx", "8192", "--window", "4"]
     for f in files: cmd += ["--tokens-file", str(f)]
-    rc, out, err, secs = run(cmd, 900)
-    rows = re.findall(r"prompt: (\d+) tokens in ([\d.]+) s \(", err)
+    for attempt in range(2):   # a known, rare crash of this run ("free(): invalid size", docs/LOG.md 2026-10-13): once more
+        rc, out, err, secs = run(cmd, 900)
+        rows = re.findall(r"prompt: (\d+) tokens in ([\d.]+) s \(", err)
+        if not rc and len(rows) == len(files): break
     if rc or len(rows) != len(files):
         return {"ok": False, "rc": rc, "texts_done": len(rows), "log": tail(out + err)}
     n, t = sum(int(r[0]) for r in rows), sum(float(r[1]) for r in rows)
-    return {"ok": True, "window_tok_s": round(n / t, 2), "seconds": round(secs, 1)}
+    return {"ok": True, "window_tok_s": round(n / t, 2), "seconds": round(secs, 1), "retried": attempt}
 
 
 def speed(binary, model):
@@ -181,9 +183,11 @@ def speed_avg(binary, model, runs):
 def prompt32(binary, model):
     """the 32K prompt's time (run twice in one process, the second counted: the first may read the n-gram table from the SSD)"""
     f = str(HERE / "prompts" / "32k.tokens")
-    rc, out, err, secs = run([str(binary), "--model", str(model), "--ctx", "40960", "--gen", "1", "--spec", "0", "--no-prepass",
-                              "--tokens-file", f, "--tokens-file", f], 900)
-    rows = re.findall(r"prompt: (\d+) tokens in ([\d.]+) s;", out)
+    for _ in range(2):   # (once more after a crash, as in windows())
+        rc, out, err, secs = run([str(binary), "--model", str(model), "--ctx", "40960", "--gen", "1", "--spec", "0", "--no-prepass",
+                                  "--tokens-file", f, "--tokens-file", f], 900)
+        rows = re.findall(r"prompt: (\d+) tokens in ([\d.]+) s;", out)
+        if not rc and len(rows) == 2: break
     if rc or len(rows) != 2: return None
     return float(rows[-1][1])
 
