@@ -64,8 +64,9 @@ std::string trim(const std::string & s) {
 }
 }  // namespace
 
-// the model's template (bench/prompts/chat_template.jinja) for text-only messages without tools
-std::string Text::render(const std::vector<Message> & msgs, bool add_generation_prompt, const std::string & think) {
+// the model's template (bench/prompts/chat_template.jinja) for text messages, with function calling
+std::string Text::render(const std::vector<Message> & msgs, bool add_generation_prompt, const std::string & think,
+                         const std::vector<std::string> & tools) {
     std::string out, system;
     size_t i = 0;
     for (; i < msgs.size() && (msgs[i].role == "system" || msgs[i].role == "developer"); ++i) {
@@ -79,14 +80,37 @@ std::string Text::render(const std::vector<Message> & msgs, bool add_generation_
     else if (think == "low")
         effort = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without "
                  "unnecessary elaboration.";
-    if (!system.empty()) out += "<|im_start|>system\n" + (effort.empty() ? "" : effort + "\n\n") + system + "<|im_end|>\n";
+    if (!tools.empty()) {   // the function definitions and how to call them, then the system text
+        out += "<|im_start|>system\n" + (effort.empty() ? "" : effort + "\n\n") +
+               "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const std::string & t : tools) out += "\n" + t;
+        out += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
+               "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+               "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+               "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified "
+               "format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+               "- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural "
+               "language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question "
+               "like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+        if (!system.empty()) out += "\n\n" + system;
+        out += "<|im_end|>\n";
+    } else if (!system.empty()) out += "<|im_start|>system\n" + (effort.empty() ? "" : effort + "\n\n") + system + "<|im_end|>\n";
     else if (!effort.empty()) out += "<|im_start|>system\n" + effort + "<|im_end|>\n";
     for (; i < msgs.size(); ++i) {
         const Message & m = msgs[i];
         const std::string c = trim(m.content);
         if (m.role == "system" || m.role == "developer") throw std::runtime_error("a system message must come first");
         if (m.role == "user") out += "<|im_start|>user\n" + c + "<|im_end|>\n";
-        else if (m.role == "assistant") out += "<|im_start|>assistant\n<think>\n" + trim(m.reasoning) + "\n</think>\n\n" + c + "<|im_end|>\n";
+        else if (m.role == "assistant") {
+            out += "<|im_start|>assistant\n<think>\n" + trim(m.reasoning) + "\n</think>\n\n" + c;
+            for (size_t k = 0; k < m.tool_calls.size(); ++k) {
+                const ToolCall & tc = m.tool_calls[k];
+                out += (k ? "\n<tool_call>\n<function=" : c.empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=") + tc.name + ">\n";
+                for (const auto & [name, value] : tc.args) out += "<parameter=" + name + ">\n" + value + "\n</parameter>\n";
+                out += "</function>\n</tool_call>";
+            }
+            out += "<|im_end|>\n";
+        }
         else if (m.role == "tool") {
             if (i == 0 || msgs[i - 1].role != "tool") out += "<|im_start|>user";
             out += "\n<tool_response>\n" + c + "\n</tool_response>";

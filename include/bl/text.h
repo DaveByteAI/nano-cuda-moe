@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bl {
@@ -20,13 +21,20 @@ public:
     std::string      detokenize(const std::vector<int> & tokens) const;
     bool             is_eog(int token) const;  // end of generation (<|im_end|>, <|endoftext|>, ...)
 
+    struct ToolCall {
+        std::string name;
+        std::vector<std::pair<std::string, std::string>> args;   // name, value as written (a string as is, else JSON)
+    };
     struct Message {
         std::string role;        // system | developer | user | assistant | tool
         std::string content;
         std::string reasoning;   // an assistant turn's thinking (optional)
+        std::vector<ToolCall> tool_calls = {};   // an assistant turn's function calls
     };
-    // the reasoning effort when thinking: "" = off, "low", "medium", "xhigh"
-    static std::string render(const std::vector<Message> & messages, bool add_generation_prompt, const std::string & think);
+    // the reasoning effort when thinking: "" = off, "low", "medium", "xhigh"; tools: the function definitions, each one
+    // JSON as the template's tojson writes it
+    static std::string render(const std::vector<Message> & messages, bool add_generation_prompt, const std::string & think,
+                              const std::vector<std::string> & tools = {});
 
 private:
     struct Impl;
