@@ -123,7 +123,7 @@ build/bl-server --model models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002
 
 | | |
 |---|---|
-| `--ctx N` | 上下文长度（默认 32768，最长测到 262144，即模型的上限）。越长，留给专家缓存的显存越少：262144 要占 3.9 GB |
+| `--ctx N` | 上下文长度，写 token 数或 `64k`、`128k`、`256k`（默认 32768，最长测到 262144，即模型的上限）。越长，留给专家缓存的显存越少：262144 要占 3.9 GB |
 | `--expert-cache FILE` | 每次回复后保存显存里的专家缓存，下次启动时从它开始 |
 | `POST /v1/chat/completions` | `messages`、`stream`、`temperature`（0.7）、`top_p`（0.8）、`top_k`（20）、`max_tokens`、`seed`、`reasoning_effort` 或 `chat_template_kwargs.enable_thinking`；思考内容在 `reasoning_content` 里返回；`spec`（MTP 草稿数，0–3） |
 | `GET /v1/models`、`GET /health` | |

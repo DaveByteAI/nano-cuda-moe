@@ -201,11 +201,12 @@ def main():
     ap.add_argument("--root", default=".", help="the working directory; files outside it are out of reach")
     ap.add_argument("--think", default="low", help="reasoning effort: low, medium, xhigh, off")
     ap.add_argument("--yes", action="store_true", help="run shell commands without asking")
-    ap.add_argument("--ctx", type=int, default=32768, help="the server's --ctx (the history is trimmed at 60%%)")
+    ap.add_argument("--ctx", default="32k", help="the server's --ctx: 32k, 64k, 128k, 256k or tokens (the history is trimmed at 60%%)")
     ap.add_argument("--max-tokens", type=int, default=8192, help="per reply, thinking included")
     ap.add_argument("--max-steps", type=int, default=40, help="tool rounds per request")
     ap.add_argument("--prompt", help="run this one request and exit")
     a = ap.parse_args()
+    a.ctx = int(a.ctx[:-1]) * 1024 if a.ctx[-1:] in "kK" else int(a.ctx)
     s = Session(a)
     if a.prompt:
         s.turn(a.prompt)

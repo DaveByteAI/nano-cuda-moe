@@ -22,7 +22,7 @@ int main(int argc, char ** argv) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--model") model = next();
-        else if (a == "--ctx") ctx = std::stoi(next());
+        else if (a == "--ctx") ctx = bl::parse_ctx(next());
         else if (a == "--temp") cp.sampling.temperature = std::stof(next());
         else if (a == "--top-p") cp.sampling.top_p = std::stof(next());
         else if (a == "--top-k") cp.sampling.top_k = std::stoi(next());

@@ -156,7 +156,7 @@ class Agent:
     def teardown(self):
         self.brain.stop()
         subprocess.Popen([str(ROOT / "build" / "bl-server"), "--model", str(MODEL), "--host", "0.0.0.0", "--port", "8080",
-                          "--ctx", "32768"], stdout=open(ROOT / "logs" / "server.log", "w"), stderr=subprocess.STDOUT,
+                          "--ctx", "256k"], stdout=open(ROOT / "logs" / "server.log", "w"), stderr=subprocess.STDOUT,
                          start_new_session=True, cwd=ROOT)
         rc, kept = sh(["git", "-C", str(self.work), "log", "--oneline", "main..HEAD"])
         summary = f"# Agent run {self.stamp}\n\nbranch {self.branch}, worktree {self.work}\n\nkept commits:\n{kept or '(none)'}\n\n" + \

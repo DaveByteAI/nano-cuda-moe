@@ -9,7 +9,7 @@
 // Thinking is off unless the request asks (enable_thinking: true or a reasoning_effort); the thinking comes back as
 // reasoning_content. The engine keeps the conversation between requests: a request that continues it (the same
 // messages plus new ones) only feeds the new part.
-//   bl-server --model SHARD1.gguf [--host 127.0.0.1] [--port 8080] [--ctx 32768] [--name NAME] [--web DIR|none]
+//   bl-server --model SHARD1.gguf [--host 127.0.0.1] [--port 8080] [--ctx 32k|64k|128k|256k] [--name NAME] [--web DIR|none]
 //             [--expert-cache FILE]
 // Switching models while running: GET /bl/models lists the quantizations next to --model (files "...-00001-of-N.gguf"
 // with all their shards) and the state; POST /bl/models {"id": "IQ3_S"} answers at once and swaps the model in the
@@ -165,7 +165,7 @@ int main(int argc, char ** argv) {
         if (a == "--model") model = next();
         else if (a == "--host") host = next();
         else if (a == "--port") port = std::stoi(next());
-        else if (a == "--ctx") ctx = std::stoi(next());
+        else if (a == "--ctx") ctx = bl::parse_ctx(next());
         else if (a == "--name") name = next();
         else if (a == "--web") web = next();   // the chat page's directory (default: ../web next to the executable)
         else if (a == "--expert-cache") cache_file = next();

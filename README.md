@@ -128,7 +128,7 @@ In the terminal: `build/bl-chat --model models/...-00001-of-00002.gguf`.
 
 | | |
 |---|---|
-| `--ctx N` | context length (default 32768; up to 262144, the model's maximum, tested). A longer context leaves less VRAM for the expert cache: 262144 takes 3.9 GB of it |
+| `--ctx N` | context length, in tokens or as `64k`, `128k`, `256k` (default 32768; up to 262144, the model's maximum, tested). A longer context leaves less VRAM for the expert cache: 262144 takes 3.9 GB of it |
 | `--expert-cache FILE` | save the VRAM expert cache after each reply and start from it next time |
 | `POST /v1/chat/completions` | `messages`, `stream`, `temperature` (0.7), `top_p` (0.8), `top_k` (20), `max_tokens`, `seed`, `reasoning_effort` or `chat_template_kwargs.enable_thinking`; thinking comes back as `reasoning_content`; `spec` (MTP drafts, 0-3) |
 | `GET /v1/models`, `GET /health` | |

@@ -80,7 +80,7 @@ int main(int argc, char ** argv) {
         else if (a == "--tokens-file") tokens_file = tokens_file.empty() ? next() : tokens_file + ";" + next();
         else if (a == "--ref") ref_dir = next();
         else if (a == "--gen") gen = std::stoi(next());
-        else if (a == "--ctx") ctx = std::stoi(next());
+        else if (a == "--ctx") ctx = bl::parse_ctx(next());
         else if (a == "--save-logits") save_logits = next();
         else if (a == "--save-last") save_last = std::stoi(next());   // with --save-logits: only the last N positions
         else if (a == "--set") sweep = next();          // key=v1,v2,...: one run per value, same loaded model
