@@ -127,7 +127,7 @@ build/bl-server --model models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002
 | `--expert-cache FILE` | 每次回复后保存显存里的专家缓存，下次启动时从它开始 |
 | `POST /v1/chat/completions` | `messages`、`stream`、`temperature`（0.7）、`top_p`（0.8）、`top_k`（20）、`max_tokens`、`seed`、`reasoning_effort` 或 `chat_template_kwargs.enable_thinking`；思考内容在 `reasoning_content` 里返回；`spec`（MTP 草稿数，0–3） |
 | `GET /v1/models`、`GET /health` | |
-| `GET /bl/models`、`POST /bl/models {"id": "IQ3_S"}` | 列出 `--model` 同目录下的量化版本并切换（聊天网页的设置面板里也能切）；重新加载需要 30–60 秒，期间聊天请求返回 503；新模型加载失败会自动换回原来的 |
+| `GET /bl/models`、`POST /bl/models {"id": "IQ3_S"}` | 列出 `--model` 同目录下的量化版本（以及服务器的上下文长度 `ctx`）并切换（聊天网页的设置面板里也能切）；重新加载需要 30–60 秒，期间聊天请求返回 503；新模型加载失败会自动换回原来的 |
 
 一次处理一个请求；如果新请求是在上一次对话后面接着说，只处理新增的部分（见 `usage.prompt_tokens_details.cached_tokens`）。
 聊天网页会把 SVG 代码块直接画成图，所以可以说"画一只钓鱼的小猫"。

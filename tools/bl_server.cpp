@@ -225,7 +225,7 @@ int main(int argc, char ** argv) {
         json list = json::array();
         for (const auto & m : list_models(model)) list.push_back({{"id", m.id}, {"gb", std::round(m.gb * 10) / 10}});
         std::lock_guard<std::mutex> lk(state_mu);
-        res.set_content(json{{"current", current}, {"state", state}, {"target", target}, {"error", switch_error}, {"models", list}}.dump(),
+        res.set_content(json{{"current", current}, {"state", state}, {"target", target}, {"error", switch_error}, {"ctx", ctx}, {"models", list}}.dump(),
                         "application/json");
     });
     srv.Post("/bl/models", [&](const httplib::Request & req, httplib::Response & res) {

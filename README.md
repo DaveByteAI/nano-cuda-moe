@@ -132,7 +132,7 @@ In the terminal: `build/bl-chat --model models/...-00001-of-00002.gguf`.
 | `--expert-cache FILE` | save the VRAM expert cache after each reply and start from it next time |
 | `POST /v1/chat/completions` | `messages`, `stream`, `temperature` (0.7), `top_p` (0.8), `top_k` (20), `max_tokens`, `seed`, `reasoning_effort` or `chat_template_kwargs.enable_thinking`; thinking comes back as `reasoning_content`; `spec` (MTP drafts, 0-3) |
 | `GET /v1/models`, `GET /health` | |
-| `GET /bl/models`, `POST /bl/models {"id": "IQ3_S"}` | list the quantizations next to `--model` and switch to one (also in the chat page's settings); the reload takes 30-60 s, chat requests meanwhile get 503, and a model that fails to load gives way to the previous one |
+| `GET /bl/models`, `POST /bl/models {"id": "IQ3_S"}` | list the quantizations next to `--model` (and the server's `ctx`) and switch to one (also in the chat page's settings); the reload takes 30-60 s, chat requests meanwhile get 503, and a model that fails to load gives way to the previous one |
 
 One request is served at a time; a request that continues the previous conversation only processes the new part
 (`usage.prompt_tokens_details.cached_tokens`). The chat page draws SVG code blocks as pictures, so "draw a cat
