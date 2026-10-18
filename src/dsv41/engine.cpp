@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -27,6 +28,7 @@
 #include "bl/cuda_prefill.h"
 #include "bl/cuda_quant.h"
 #include "bl/dsv41_ops.h"
+#include "ram_tier.h"
 
 namespace bl {
 
@@ -82,7 +84,14 @@ struct Dsv41Engine::Impl {
     Probe probe;
 
     // per layer: the routed experts in the mapped file
-    struct LayerExperts { const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr; };
+    struct LayerExperts {
+        const uint8_t * gate = nullptr, * up = nullptr, * down = nullptr;   // in the mapped files
+        int      fd[3] = {-1, -1, -1};                                     // O_DIRECT descriptors of their shards
+        uint64_t off[3] = {};                                               // file offsets of expert 0's part
+    };
+    // RAM tier (src/dsv41/ram_tier.h): BL_DSV41_RAM_GB (default: MemAvailable - 12 GB), BL_DSV41_IO_THREADS (4)
+    std::unique_ptr<ExpertRam> ram;
+    std::vector<int> direct_fd;   // per opened shard
     std::vector<LayerExperts> experts;
     size_t gu_expert_bytes = 0, d_expert_bytes = 0, gu_row_bytes = 0, d_row_bytes = 0;
     uint32_t expert_type = 0;
@@ -122,7 +131,7 @@ struct Dsv41Engine::Impl {
     int admit = std::getenv("BL_DSV41_ADMIT") ? std::atoi(std::getenv("BL_DSV41_ADMIT")) : 1;
     std::unique_ptr<CpuExperts> cpu;
     float * x_h = nullptr, * cpu_out_h = nullptr, * cpu_out_d = nullptr;
-    double t_cpu = 0, t_gpu_wait = 0;
+    double t_cpu = 0, t_gpu_wait = 0, t_ram = 0;
     uint64_t cpu_experts = 0;
     cuda::ExpertPlan * plan_h = nullptr, * plan_d = nullptr;
     void * xq = nullptr;
@@ -272,7 +281,20 @@ struct Dsv41Engine::Impl {
             }
             if (tg.type_id != expert_type || tu.type_id != expert_type || td.type_id != expert_type)
                 throw std::runtime_error(p + ": expert formats differ from layer 0");
-            experts.push_back({tg.data, tu.data, td.data});
+            LayerExperts le;
+            le.gate = tg.data; le.up = tu.data; le.down = td.data;
+            const Tensor * parts[3] = {&tg, &tu, &td};
+            for (int k = 0; k < 3; ++k) {
+                if (direct_fd.empty())
+                    for (size_t i = 0; i < g.n_shards(); ++i) {
+                        int fd = ::open(g.shard_path(static_cast<uint32_t>(i)).c_str(), O_RDONLY | O_DIRECT);
+                        if (fd < 0) fd = ::open(g.shard_path(static_cast<uint32_t>(i)).c_str(), O_RDONLY);   // no O_DIRECT here
+                        direct_fd.push_back(fd);
+                    }
+                le.fd[k] = direct_fd.at(parts[k]->shard);
+                le.off[k] = g.file_offset(*parts[k]);
+            }
+            experts.push_back(le);
         }
         if (!engram_on) std::fprintf(stderr, "dsv41: WARNING: Engram tables missing (files 8, 9) - running WITHOUT Engram; logits will be wrong\n");
         upload_mat("output.weight");
@@ -383,6 +405,41 @@ struct Dsv41Engine::Impl {
         for (int i = 0; i < n_slots; ++i) lru.push_back(i);
         std::fprintf(stderr, "dsv41: expert cache %d slots (%.1f GB, %.1f%% of all experts)\n", n_slots,
                      static_cast<double>(n_slots) * per / 1e9, 100.0 * n_slots / (static_cast<double>(c.n_layer) * c.n_expert));
+        {   // the RAM tier: what is available now, less room for the system and the Engram rows' page cache
+            size_t avail = 0;
+            if (FILE * f = std::fopen("/proc/meminfo", "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof line, f))
+                    if (std::sscanf(line, "MemAvailable: %zu kB", &avail) == 1) { avail *= 1024; break; }
+                std::fclose(f);
+            }
+            // 12 GB left: the system, the Engram rows' pages, and any file I/O (a download) in the page cache
+            size_t want = avail > (size_t{12} << 30) ? avail - (size_t{12} << 30) : 0;
+            if (const char * e = std::getenv("BL_DSV41_RAM_GB")) want = static_cast<size_t>(std::atof(e) * (1ull << 30));
+            const int iot = std::getenv("BL_DSV41_IO_THREADS") ? std::atoi(std::getenv("BL_DSV41_IO_THREADS")) : 4;
+            want = std::max(want, per * static_cast<size_t>(c.n_expert));   // at least one layer's worth
+            ram = std::make_unique<ExpertRam>(want, per, iot, true);
+            std::fprintf(stderr, "dsv41: RAM tier %d slots (%.1f GB, %.1f%% of all experts)%s\n", ram->slots(), ram->bytes() / 1e9,
+                         100.0 * ram->slots() / (static_cast<double>(c.n_layer) * c.n_expert), ram->pinned() ? ", pinned" : "");
+        }
+    }
+
+    ExpertRam::Src src_of(int il, int e) const {
+        ExpertRam::Src s{};
+        const size_t len[3] = {gu_expert_bytes, gu_expert_bytes, d_expert_bytes};
+        for (int k = 0; k < 3; ++k) {
+            s.fd[k] = experts[il].fd[k];
+            s.off[k] = experts[il].off[k] + static_cast<uint64_t>(e) * len[k];
+            s.len[k] = len[k];
+        }
+        return s;
+    }
+    // the experts e[0..n) of layer il resident in RAM (read in parallel where missing); out[i] = expert e[i]'s slot
+    void ram_get(int il, const int * e, int n, const uint8_t ** out) {
+        std::vector<int> keys(n);
+        std::vector<ExpertRam::Src> src(n);
+        for (int i = 0; i < n; ++i) { keys[i] = il * c.n_expert + e[i]; src[i] = src_of(il, e[i]); }
+        ram->fetch(keys.data(), src.data(), n, out);
     }
 
     // the VRAM slot holding expert e of layer il; copied in on a miss. Slots used in this layer stay put: the LRU
@@ -404,10 +461,9 @@ struct Dsv41Engine::Impl {
         lru.push_front(slot);
         where[key] = lru.begin();
         uint8_t * dst = xslots + static_cast<size_t>(slot) * per;
-        const size_t ee = static_cast<size_t>(e);
-        ck(cudaMemcpyAsync(dst, experts[il].gate + ee * gu_expert_bytes, gu_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
-        ck(cudaMemcpyAsync(dst + gu_expert_bytes, experts[il].up + ee * gu_expert_bytes, gu_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
-        ck(cudaMemcpyAsync(dst + 2 * gu_expert_bytes, experts[il].down + ee * d_expert_bytes, d_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
+        const uint8_t * src = nullptr;   // from the RAM tier (read from disk first if it is not there)
+        ram_get(il, &e, 1, &src);
+        ck(cudaMemcpyAsync(dst, src, per, cudaMemcpyHostToDevice, st), "expert");
         return dst;
     }
 
@@ -417,6 +473,8 @@ struct Dsv41Engine::Impl {
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
         if (pf.erows_h) cudaFreeHost(pf.erows_h);
+        ram.reset();
+        for (int fd : direct_fd) if (fd >= 0) ::close(fd);
         if (x_h) cudaFreeHost(x_h);
         if (cpu_out_h) cudaFreeHost(cpu_out_h);
         if (st) cudaStreamDestroy(st);
@@ -636,18 +694,14 @@ struct Dsv41Engine::Impl {
             ck(cudaMemcpy(x_h, x, D * 4, cudaMemcpyDeviceToHost), "x");
             const int n = static_cast<int>(ck_.size());
             std::vector<CpuExperts::Job> jobs(n);
-            const long pg = sysconf(_SC_PAGESIZE);
-            auto willneed = [&](const uint8_t * a, size_t len) {   // start the disk reads of all misses at once
-                const uintptr_t b = reinterpret_cast<uintptr_t>(a) & ~static_cast<uintptr_t>(pg - 1);
-                madvise(reinterpret_cast<void *>(b), len + (reinterpret_cast<uintptr_t>(a) - b), MADV_WILLNEED);
-            };
-            for (int j = 0; j < n; ++j) {
-                const size_t e = static_cast<size_t>(hid[ck_[j]]);
-                const uint8_t * gp = experts[il].gate + e * gu_expert_bytes, * up = experts[il].up + e * gu_expert_bytes,
-                              * dp = experts[il].down + e * d_expert_bytes;
-                willneed(gp, gu_expert_bytes); willneed(up, gu_expert_bytes); willneed(dp, d_expert_bytes);
-                jobs[j] = {gp, 1, cpu_out_h + static_cast<size_t>(j) * D, up, dp};
-            }
+            // the misses from the RAM tier; the ones not there are read from disk, all at once
+            std::vector<int> ev(n);
+            for (int j = 0; j < n; ++j) ev[j] = hid[ck_[j]];
+            std::vector<const uint8_t *> slot(n);
+            const auto tr = std::chrono::steady_clock::now();
+            ram_get(il, ev.data(), n, slot.data());
+            t_ram += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count();
+            for (int j = 0; j < n; ++j) jobs[j] = {slot[j], 1, cpu_out_h + static_cast<size_t>(j) * D};
             cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), n, lim);
             cpu_experts += n;
             t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -906,6 +960,15 @@ struct Dsv41Engine::Impl {
         std::vector<float> wv(A);
         std::vector<cuda::MoeItem> items;
         const auto t0 = std::chrono::steady_clock::now();
+        {   // the experts not in VRAM: into RAM in one parallel read first, so the copies below come from memory
+            std::vector<int> need;
+            for (int i = 0; i < A; ++i) {
+                const int e = hid[order[i]];
+                if ((i == 0 || e != hid[order[i - 1]]) && !where.count(il * c.n_expert + e)) need.push_back(e);
+            }
+            std::vector<const uint8_t *> dummy(need.size());
+            if (!need.empty()) ram_get(il, need.data(), static_cast<int>(need.size()), dummy.data());
+        }
         const int tile = cuda::moe_tile();
         for (int i = 0; i < A;) {
             int j = i;
@@ -1064,6 +1127,14 @@ int Dsv41Engine::position() const { return static_cast<int>(p_->toks.size()); }
 const std::vector<float> & Dsv41Engine::step(int token) { return p_->step(token); }
 const std::vector<float> & Dsv41Engine::prefill(const std::vector<int> & t, std::vector<float> * all) { return p_->prefill(t, all); }
 void Dsv41Engine::set_probe(Probe p) { p_->probe = std::move(p); }
+void Dsv41Engine::reset_stats() {
+    auto & q = *p_;
+    q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_prefill = 0;
+    q.n_steps = 0;
+    q.n_prefill = 0;
+    q.hits = q.misses = q.cpu_experts = 0;
+    if (q.ram) { q.ram->hits = q.ram->reads = 0; q.ram->read_s = 0; }
+}
 
 std::string Dsv41Engine::report() const {
     std::ostringstream os;
@@ -1077,7 +1148,10 @@ std::string Dsv41Engine::report() const {
        << q.hits + q.misses;
     if (q.hybrid)
         os << "; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
-           << " ms, then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms";
+           << " ms (of it RAM tier / disk " << 1000.0 * q.t_ram / ns << " ms), then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms";
+    if (q.ram)
+        os << "; RAM tier: " << q.ram->hits << " hits, " << q.ram->reads << " disk reads in " << q.ram->read_s << " s ("
+           << (q.ram->read_s > 0 ? q.ram->reads * 9.12e-3 / q.ram->read_s : 0.0) << " GB/s)";
     return os.str();
 }
 

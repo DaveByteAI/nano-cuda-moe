@@ -48,7 +48,7 @@ void usage() {
 
 int main(int argc, char ** argv) {
     std::string model, tokens_s, tokens_file, save_logits, dump_dir, filter = ".*";
-    int gen = 0, ctx = 4096;
+    int gen = 0, ctx = 4096, stats_after = -1;
     bool engram_rows = false, use_prefill = false, check_prefill = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -65,6 +65,7 @@ int main(int argc, char ** argv) {
         else if (a == "--dump") dump_dir = next();
         else if (a == "--filter") filter = next();
         else if (a == "--engram-rows") engram_rows = true;
+        else if (a == "--stats-after") stats_after = std::stoi(next());   // the report covers only the steps after N generated
         else if (a == "--prefill") use_prefill = true;          // the prompt through prefill(), then --gen steps
         else if (a == "--check-prefill") check_prefill = true;  // prefill's logits against stepping each token
         else { usage(); return 2; }
@@ -186,6 +187,7 @@ int main(int argc, char ** argv) {
         }
         std::vector<int> out;
         for (int i = 0; i < gen; ++i) {
+            if (i == stats_after) eng.reset_stats();
             out.push_back(last);
             const auto & l = eng.step(last);
             last = top(l, 1)[0];

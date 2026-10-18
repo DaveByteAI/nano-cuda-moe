@@ -100,7 +100,7 @@ if(BL_ENABLE_CUDA)
   target_link_libraries(bl-ref-dump PRIVATE llama ggml)
 
   # DeepSeek-V4.1-Flash (deepseek41), phase A: docs/DSV41.md
-  add_library(bl_dsv41 STATIC src/dsv41/config.cpp src/dsv41/ops.cu src/dsv41/engine.cpp)
+  add_library(bl_dsv41 STATIC src/dsv41/config.cpp src/dsv41/ops.cu src/dsv41/engine.cpp src/dsv41/ram_tier.cpp)
   target_include_directories(bl_dsv41 PUBLIC include)
   target_link_libraries(bl_dsv41 PUBLIC bl_cuda)
   add_executable(bl-dsv41 tools/bl_dsv41.cpp)

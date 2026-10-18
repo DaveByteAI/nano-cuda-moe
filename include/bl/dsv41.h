@@ -85,6 +85,7 @@ public:
     void set_probe(Probe p);
 
     std::string report() const;   // where the time went
+    void reset_stats();
 
 private:
     struct Impl;
