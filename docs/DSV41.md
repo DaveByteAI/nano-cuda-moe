@@ -133,3 +133,27 @@ Wkv 2.8 MB、hc_fn 3.9 MB、路由器 3.9 MB；源层再加压缩器 10.5 MB 和
 2. 显存 24 GB 减去稠密的 8.9 GB、KV 和工作区，约剩 13 GB 给专家，只占 140 GB 的 9%。
    内存 62 GB 大约还能放 45 GB，其余约 80 GB 在 NVMe 上。**专家的三层存储（显存、内存、NVMe）是这个模型最重要的工程。**
 3. Engram 表必须放在 NVMe 上：第 1 层没有时间去藏读盘的延迟，prefill 一次要随机读上万行。
+
+## 实测：一个专家的代价（`tests/bench_dsv41_experts`，第 0–29 层的真实 IQ2_XXS 专家）
+
+| 路径 | 一层 6 个专家 | 说明 |
+|---|---|---|
+| GPU fp32 matvec（阶段 1 的通用 kernel） | 0.31 ms（177 GB/s） | 与 double 参照的相对误差 1.8e-7：对拍用这条 |
+| GPU dp4a（decode 流水线的 `plan_gate_up`/`plan_down`，q8_1 激活） | **0.12 ms**（457 GB/s） | 相对 fp32 1.2e-2；`BL_DSV41_DP4A=1` |
+| PCIe 拷进显存（锁页内存，12.4 GB/s） | 4.4 ms | 只拷不算 |
+| CPU（8 线程，ggml 点积，q8_K 激活） | **2.65 ms**（T=1），5.9 ms（T=4） | 相对 double 1.7e-2 |
+
+所以未命中显存的专家**在 CPU 上算比拷进显存便宜**（2.65 ms 对 4.4 ms），这和 Qwen3.8 上的结论相同。
+`BL_DSV41_HYBRID=1`：命中的在 GPU 上算（dp4a），同时 CPU 在映射的文件上算未命中的；页缓存就是内存这一层，
+它后面的 NVMe 是第三层；每层每 token 再把 `BL_DSV41_ADMIT` 个未命中的拷进显存缓存。
+
+粗算（每 token）：稠密 ~10.6 ms 下限；专家显存命中率 h 时 GPU 0.12·h·40 ms、CPU 2.65·(1−h)·40 ms，两边并行。
+h = 50% 时约 55–60 ms/token，即 ~17 tok/s，NVMe 未命中另算。
+
+## 阶段 B 计划（按收益排序）
+
+1. 混合专家路径调好：准入策略（按频率而不是每层 1 个）、CPU 线程数、CPU 与 GPU 的重叠。
+2. 批量 prefill：稠密部分按层把 T 个 token 一起算（权重读一次），专家按"被哪些 token 选中"分组。
+3. 去掉每层一次的路由同步：GPU 自己决定命中与未命中（Qwen3.8 的 doorbell 流水线），整 token 一个 CUDA graph。
+4. 稠密部分换 4 bit 格式（显存和 10.6 ms 下限都减半），先测精度。
+5. 投机解码：DSpark 层（官方权重里有，这个 GGUF 没有）。
