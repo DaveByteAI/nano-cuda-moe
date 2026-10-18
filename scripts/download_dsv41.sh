@@ -45,8 +45,9 @@ fetch() {   # fetch <url> <dir> <name>
     # the mirror itself answers 429 to a burst of requests: never hand aria2c the mirror URL, wait for a location
     local cdn="" wait=10
     while [ -z "$cdn" ]; do
+      # || true: a timed-out curl fails the pipeline, and under set -e that would end the script silently
       cdn=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-            curl -sI -m 30 "$url" | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -1)
+            curl -sI -m 30 "$url" | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -1) || true
       if [ -z "$cdn" ]; then echo "== $name: no redirect from the mirror (rate limit?), again in $wait s"; sleep $wait; wait=$((wait < 120 ? wait * 2 : 120)); fi
     done
     if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
