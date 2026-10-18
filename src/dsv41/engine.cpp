@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "bl/cuda_ops.h"
+#include "bl/cuda_pipeline.h"
 #include "bl/cuda_quant.h"
 #include "bl/dsv41_ops.h"
 
@@ -106,6 +107,12 @@ struct Dsv41Engine::Impl {
     std::unordered_map<int, std::list<int>::iterator> where;
     std::list<int> lru;                                     // slots, most recently used first
     uint64_t hits = 0, misses = 0;
+    // BL_DSV41_DP4A=1: the experts through the decode pipeline's dp4a kernels (q8_1 activations, 2.6x faster);
+    // default the fp32 matvec, exact against a double reference (for the comparisons with llama.cpp)
+    bool dp4a = std::getenv("BL_DSV41_DP4A") && std::atoi(std::getenv("BL_DSV41_DP4A")) != 0;
+    cuda::ExpertPlan * plan_h = nullptr, * plan_d = nullptr;
+    void * xq = nullptr;
+    float * pact = nullptr, * pout = nullptr;
     float * logits_d = nullptr;
     std::vector<float *> win;                               // per layer [window][head_dim] ring
     std::vector<float *> comp_kv, idx_keys;                 // per source layer: [max_ctx / ratio][...]
@@ -289,6 +296,13 @@ struct Dsv41Engine::Impl {
         }
         ck(cudaDeviceSynchronize(), "load");
 
+        if (dp4a) {
+            ck(cudaMallocHost(&plan_h, sizeof(cuda::ExpertPlan)), "pinned");
+            plan_d = dalloc<cuda::ExpertPlan>(1);
+            xq = dalloc<uint8_t>(cuda::q8_bytes(D));
+            pact = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * c.n_ff_exp);
+            pout = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * D);
+        }
         // the expert cache takes the rest of VRAM
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
         size_t fr = 0, to = 0;
@@ -333,6 +347,7 @@ struct Dsv41Engine::Impl {
         if (st) cudaStreamSynchronize(st);
         for (void * p : allocs) cudaFree(p);
         if (erows_h) cudaFreeHost(erows_h);
+        if (plan_h) cudaFreeHost(plan_h);
         if (st) cudaStreamDestroy(st);
     }
 
@@ -476,7 +491,20 @@ struct Dsv41Engine::Impl {
         t_expert_copy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
         ck(cudaMemsetAsync(moe, 0, D * 4, st), "moe");
-        for (int k = 0; k < K; ++k) {
+        if (dp4a) {   // one plan of K resident slots (the previous layer's plan copy finished at the router's sync)
+            std::memset(plan_h, 0, sizeof *plan_h);
+            plan_h->T = 1; plan_h->K = K; plan_h->n_slots = K;
+            for (int k = 0; k < K; ++k) {
+                plan_h->ids[k] = hid[k]; plan_h->kind[k] = cuda::kHit; plan_h->mask[k] = 1; plan_h->base[k] = base_k[k];
+                plan_h->sel[0][k] = k; plan_h->w[0][k] = hw[k];
+            }
+            ck(cudaMemcpyAsync(plan_d, plan_h, sizeof *plan_h, cudaMemcpyHostToDevice, st), "plan");
+            cuda::quantize_q8(x, D, xq, st);
+            cuda::plan_gate_up(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, xq, pact, st, lim);
+            cuda::plan_down(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, pact, pout, st);
+            for (int k = 0; k < K; ++k) cuda::axpy(moe, pout + static_cast<size_t>(k) * cuda::kMaxT * D, hw[k], D, st);
+        }
+        for (int k = 0; k < (dp4a ? 0 : K); ++k) {
             const uint8_t * base = base_k[k];
             cuda::matvec(expert_type, base, gu_row_bytes, F, D, x, gbuf, st);
             cuda::matvec(expert_type, base + gu_expert_bytes, gu_row_bytes, F, D, x, ubuf, st);

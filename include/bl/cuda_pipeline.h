@@ -90,8 +90,9 @@ void   quantize_q8(const float * x, int n, void * out, cudaStream_t s, int T = 1
 
 // expert compute over the plan's slots whose kind is in `kinds` (bit mask), for all T tokens of the window:
 //   act [slot][T][F], out [slot][T][D]; xq = quantize_q8 of the input ([T] rows of D/32 blocks)
+// limit > 0: SwiGLU clamps first (gate . x at most limit, up . x within +-limit: DeepSeek-V4)
 void plan_gate_up(uint32_t type_gu, const ExpertPlan * plan, int kinds, int T, size_t gu_bytes, int F, int D,
-                  const void * xq, float * act, cudaStream_t s);
+                  const void * xq, float * act, cudaStream_t s, float limit = 0.f);
 void plan_down(uint32_t type_d, const ExpertPlan * plan, int kinds, int T, size_t gu_bytes, int F, int D,
                const float * act, float * out, cudaStream_t s);
 // per token t: h[t] = sum_k w[t][k] * (expert sel[t][k]'s output for t) + sigmoid(sg[t]) * sh[t]

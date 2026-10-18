@@ -15,6 +15,7 @@
 
 #include "bl/cpu_experts.h"
 #include "bl/cuda_ops.h"
+#include "bl/cuda_pipeline.h"
 #include "bl/cuda_quant.h"
 #include "bl/dsv41_ops.h"
 #include "bl/gguf.h"
@@ -147,6 +148,53 @@ int main(int argc, char ** argv) {
     const double us_e = 1000.0 * ms / (reps * ng);
     std::printf("GPU: %.1f us per expert (%.0f GB/s), %d resident, cold L2 -> %.2f ms per layer of 6\n", us_e,
                 per / (us_e * 1e3), ng, 6 * us_e / 1000);
+
+    // ---- the same through the decode pipeline's dp4a kernels (q8_1 activations), 6 experts per plan as in a layer
+    {
+        using namespace bl::cuda;
+        const int nplans = ng / 6;
+        std::vector<ExpertPlan> hp(nplans);
+        for (int pi = 0; pi < nplans; ++pi) {
+            ExpertPlan & pl = hp[pi];
+            std::memset(&pl, 0, sizeof pl);
+            pl.T = 1; pl.K = 6; pl.n_slots = 6;
+            for (int k = 0; k < 6; ++k) {
+                pl.ids[k] = k; pl.kind[k] = kHit; pl.mask[k] = 1; pl.base[k] = arena + per * (pi * 6 + k);
+                pl.sel[0][k] = k; pl.w[0][k] = 1.f / 6;
+            }
+        }
+        ExpertPlan * dp;
+        ck(cudaMalloc(&dp, sizeof(ExpertPlan) * nplans), "plans");
+        ck(cudaMemcpy(dp, hp.data(), sizeof(ExpertPlan) * nplans, cudaMemcpyHostToDevice), "plans");
+        void * xq;
+        float * pact, * pout;
+        ck(cudaMalloc(&xq, q8_bytes(D)), "xq");
+        ck(cudaMalloc(&pact, sizeof(float) * kMaxSlots * kMaxT * F), "act");
+        ck(cudaMalloc(&pout, sizeof(float) * kMaxSlots * kMaxT * D), "out");
+        quantize_q8(dx, D, xq, 0);
+        auto run = [&](int pi) {
+            plan_gate_up(T, dp + pi, 1 << kHit, 1, gu_b, F, D, xq, pact, 0);
+            plan_down(T, dp + pi, 1 << kHit, 1, gu_b, F, D, pact, pout, 0);
+        };
+        for (int pi = 0; pi < nplans; ++pi) run(pi);
+        cudaEventRecord(a);
+        for (int r = 0; r < reps; ++r)
+            for (int pi = 0; pi < nplans; ++pi) run(pi);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        cudaEventElapsedTime(&ms, a, b);
+        const double us_l = 1000.0 * ms / (reps * nplans);
+        std::printf("GPU dp4a pipeline kernels: %.1f us per layer of 6 (%.0f GB/s), no clamp yet\n", us_l, 6.0 * per / (us_l * 1e3));
+        // correctness of slot 0 of plan 0 against the fp32 matvec of the same expert (unclamped both: the dots are below 10)
+        run(0);
+        gpu_expert(arena, 0);
+        std::vector<float> o1(D), o2(D);
+        ck(cudaMemcpy(o1.data(), pout, D * 4, cudaMemcpyDeviceToHost), "o");
+        ck(cudaMemcpy(o2.data(), dout, D * 4, cudaMemcpyDeviceToHost), "o");
+        double num = 0, den = 0;
+        for (int i = 0; i < D; ++i) { num += (o1[i] - o2[i]) * (o1[i] - o2[i]); den += o2[i] * o2[i]; }
+        std::printf("  dp4a vs fp32 matvec on one expert: rel diff %.2e\n", std::sqrt(num / den));
+    }
 
     // ---- PCIe: one expert from pinned host memory
     uint8_t * pin;
