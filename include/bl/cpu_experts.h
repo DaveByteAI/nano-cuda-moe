@@ -21,8 +21,10 @@ public:
         float *         out;    // [T][D]: rows of the tokens in mask are written
     };
     // out[t] = down(silu(gate . x[t]) * (up . x[t])) for each job and each token in its mask; x is [T][D];
-    // blocks until all are done
-    void run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, int D, const float * x, int T, const Job * jobs, int n);
+    // blocks until all are done. swiglu_limit > 0 clamps first: gate . x at most the limit, up . x within +-limit
+    // (DeepSeek-V4's experts)
+    void run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, int D, const float * x, int T, const Job * jobs, int n,
+             float swiglu_limit = 0.f);
 
     int threads() const;
 

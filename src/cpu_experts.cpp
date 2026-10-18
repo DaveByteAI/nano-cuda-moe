@@ -41,6 +41,11 @@ struct CpuExperts::Impl {
     size_t gu_bytes = 0, gu_rb = 0, d_rb = 0, xq_rb = 0, aq_rb = 0;
     int F = 0, D = 0, n = 0, T = 1;
     bool q2_down = false;            // down is Q2_0: our AVX2 kernel (ggml's is scalar on x86)
+    float limit = 0.f;               // > 0: DeepSeek-V4's clamps, gate at most limit, up within +-limit
+    float swiglu(float g, float u) const {
+        if (limit > 0.f) { g = std::fmin(g, limit); u = std::fmin(std::fmax(u, -limit), limit); }
+        return g / (1.f + std::exp(-g)) * u;
+    }
     uint32_t type_gu = 0;
     bool iq_gu = false;              // gate/up through cpu_iq (all of a job's tokens per row) instead of ggml's vec_dot
     const float * x = nullptr;
@@ -149,7 +154,7 @@ struct CpuExperts::Impl {
             for (int r = r0; r < r0 + kGuRows; ++r) {
                 cpu::iq_gate_up(I->type_gu, g + r * I->gu_rb, u + r * I->gu_rb, I->D, xs, nt, gv, uv);
                 for (int k = 0; k < nt; ++k)
-                    I->act[(static_cast<size_t>(e) * I->T + ts[k]) * I->F + r] = gv[k] / (1.f + std::exp(-gv[k])) * uv[k];
+                    I->act[(static_cast<size_t>(e) * I->T + ts[k]) * I->F + r] = I->swiglu(gv[k], uv[k]);
             }
             return;
         }
@@ -160,7 +165,7 @@ struct CpuExperts::Impl {
                 float gv, uv;
                 I->tr_gu->vec_dot(I->D, &gv, 0, g + r * I->gu_rb, 0, xq, 0, 1);
                 I->tr_gu->vec_dot(I->D, &uv, 0, u + r * I->gu_rb, 0, xq, 0, 1);
-                I->act[(static_cast<size_t>(e) * I->T + t) * I->F + r] = gv / (1.f + std::exp(-gv)) * uv;
+                I->act[(static_cast<size_t>(e) * I->T + t) * I->F + r] = I->swiglu(gv, uv);
             }
     }
     static void quant_act_task(Impl * I, int task) {   // task = job * T + token
@@ -203,9 +208,10 @@ const char * CpuExperts::type_name(uint32_t type) {
 }
 
 void CpuExperts::run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, int D, const float * x, int T, const Job * jobs,
-                     int n) {
+                     int n, float swiglu_limit) {
     if (n == 0) return;
     Impl & I = *p_;
+    I.limit = swiglu_limit;
     const auto tg = static_cast<ggml_type>(type_gu), td = static_cast<ggml_type>(type_d);
     I.tr_gu = ggml_get_type_traits_cpu(tg);
     I.tr_d  = ggml_get_type_traits_cpu(td);
