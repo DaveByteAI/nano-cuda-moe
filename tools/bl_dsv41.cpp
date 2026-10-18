@@ -2,6 +2,7 @@
 //
 //   bl-dsv41 --model SHARD1.gguf (--tokens 1,2,3 | --tokens-file F) [--gen N] [--ctx N]
 //            [--save-logits FILE] [--dump DIR [--filter REGEX]]
+//   bl-dsv41 --model SHARD1.gguf --tokens-file F --engram-rows     (the Engram row ids per position, no weights)
 //
 // Feeds the tokens one step each, prints the top-5 after each and then greedy-generates N more. --save-logits
 // writes every fed position's logits (T rows of n_vocab float32: tools/logits_compare.py against bl-ref-dump).
@@ -45,6 +46,7 @@ void usage() {
 int main(int argc, char ** argv) {
     std::string model, tokens_s, tokens_file, save_logits, dump_dir, filter = ".*";
     int gen = 0, ctx = 4096;
+    bool engram_rows = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -59,6 +61,7 @@ int main(int argc, char ** argv) {
         else if (a == "--save-logits") save_logits = next();
         else if (a == "--dump") dump_dir = next();
         else if (a == "--filter") filter = next();
+        else if (a == "--engram-rows") engram_rows = true;
         else { usage(); return 2; }
     }
     if (model.empty() || (tokens_s.empty() && tokens_file.empty())) { usage(); return 2; }
@@ -70,6 +73,23 @@ int main(int argc, char ** argv) {
     }
     const std::vector<int> prompt = parse_ids(tokens_s);
     if (prompt.empty()) { std::fprintf(stderr, "no tokens\n"); return 2; }
+
+    if (engram_rows) {   // the Engram row ids per position, from the metadata alone (tools/dsv41_engram_check.py)
+        try {
+            bl::GgufModel g(model);
+            const bl::Dsv41Config c = bl::Dsv41Config::from_gguf(g);
+            std::vector<uint64_t> rows(c.engram_layers.size() * c.engram_cols());
+            for (size_t p = 0; p < prompt.size(); ++p) {
+                bl::dsv41_engram_rows(c, prompt.data(), static_cast<int>(p), rows.data());
+                for (size_t i = 0; i < rows.size(); ++i) std::printf("%s%llu", i ? "," : "", static_cast<unsigned long long>(rows[i]));
+                std::printf("\n");
+            }
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "error: %s\n", e.what());
+            return 1;
+        }
+        return 0;
+    }
 
     try {
         const auto t0 = std::chrono::steady_clock::now();

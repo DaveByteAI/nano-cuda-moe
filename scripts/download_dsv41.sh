@@ -42,10 +42,13 @@ fetch() {   # fetch <url> <dir> <name>
   local tries=0
   while :; do
     # one request to the mirror for the CDN location; the CDN takes the 16 connections
-    local cdn
-    cdn=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-          curl -sI -m 30 "$url" | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -1)
-    [ -n "$cdn" ] || cdn=$url
+    # the mirror itself answers 429 to a burst of requests: never hand aria2c the mirror URL, wait for a location
+    local cdn="" wait=10
+    while [ -z "$cdn" ]; do
+      cdn=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            curl -sI -m 30 "$url" | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -1)
+      if [ -z "$cdn" ]; then echo "== $name: no redirect from the mirror (rate limit?), again in $wait s"; sleep $wait; wait=$((wait < 120 ? wait * 2 : 120)); fi
+    done
     if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
        aria2c --no-conf -d "$dir" -o "$name" -x16 -s16 -k20M -c --file-allocation=falloc \
               --max-tries=5 --retry-wait=5 --timeout=60 --summary-interval=60 --console-log-level=warn "$cdn"; then
