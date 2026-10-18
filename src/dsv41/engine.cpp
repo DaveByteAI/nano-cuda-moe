@@ -633,7 +633,19 @@ struct Dsv41Engine::Impl {
         toks.push_back(token);
 
         std::vector<uint64_t> erow(c.engram_layers.size() * c.engram_cols());
-        if (engram_on) dsv41_engram_rows(c, toks.data(), pos, erow.data());
+        if (engram_on) {
+            dsv41_engram_rows(c, toks.data(), pos, erow.data());
+            // every row of both Engram layers is known now: start all their disk reads at once, so layer 1 waits
+            // about one read instead of 24 in a row, and layer 14's arrive while layers 0..13 compute
+            const long pg = sysconf(_SC_PAGESIZE);
+            const int ncol = c.engram_cols();
+            for (size_t e = 0; e < c.engram_layers.size(); ++e)
+                for (int b = 0; b < ncol; ++b) {
+                    const uint8_t * a = engram_table[e] + erow[e * ncol + b] * engram_row_bytes;
+                    const uintptr_t pa = reinterpret_cast<uintptr_t>(a) & ~static_cast<uintptr_t>(pg - 1);
+                    madvise(reinterpret_cast<void *>(pa), engram_row_bytes + (reinterpret_cast<uintptr_t>(a) - pa), MADV_WILLNEED);
+                }
+        }
 
         {   // the embedding row, repeated into the hc copies
             std::vector<float> e(D);
