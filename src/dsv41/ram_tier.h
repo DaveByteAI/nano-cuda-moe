@@ -31,6 +31,7 @@ public:
     size_t bytes() const { return static_cast<size_t>(n_) * per_; }
     bool   pinned() const { return pinned_; }
 
+    bool contains(int key) const { return where_.count(key) != 0; }   // no LRU update
     // the resident copy of `key` (moved to the LRU front), or nullptr
     const uint8_t * find(int key);
     // makes every key resident, reading the missing ones from disk in parallel; out[i] = its slot. Keys of one call

@@ -51,7 +51,7 @@ fetch() {   # fetch <url> <dir> <name>
       if [ -z "$cdn" ]; then echo "== $name: no redirect from the mirror (rate limit?), again in $wait s"; sleep $wait; wait=$((wait < 120 ? wait * 2 : 120)); fi
     done
     if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-       aria2c --no-conf -d "$dir" -o "$name" -x16 -s16 -k20M -c --file-allocation=falloc --lowest-speed-limit=5M \
+       aria2c --no-conf -d "$dir" -o "$name" -x16 -s16 -k1M -c --file-allocation=falloc --lowest-speed-limit=5M \
               --max-tries=5 --retry-wait=5 --timeout=60 --summary-interval=60 --console-log-level=warn "$cdn"; then
       return
     fi

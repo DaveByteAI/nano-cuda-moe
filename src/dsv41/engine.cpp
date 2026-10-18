@@ -144,6 +144,14 @@ struct Dsv41Engine::Impl {
     std::unique_ptr<CpuExperts> cpu;
     float * x_h = nullptr, * cpu_out_h = nullptr, * cpu_out_d = nullptr;
     double t_cpu = 0, t_gpu_wait = 0, t_ram = 0;
+    // BL_DSV41_PRED=1 (measurement): layer il+1's router on layer il's FFN input; are the misses that go to disk among
+    // its picks? (prefetch candidates)
+    bool pred_stats = std::getenv("BL_DSV41_PRED") && std::atoi(std::getenv("BL_DSV41_PRED")) != 0;
+    int pred_k = std::getenv("BL_DSV41_PRED_K") ? std::atoi(std::getenv("BL_DSV41_PRED_K")) : 6;
+    std::vector<int> pred_ids;   // the prediction for the next layer
+    int * pred_ids_d = nullptr;
+    float * pred_w_d = nullptr, * pred_logit = nullptr;
+    uint64_t pred_disk = 0, pred_disk_hit = 0, pred_all = 0, pred_all_hit = 0;
     uint64_t cpu_experts = 0;
     cuda::ExpertPlan * plan_h = nullptr, * plan_d = nullptr;
     void * xq = nullptr;
@@ -368,6 +376,7 @@ struct Dsv41Engine::Impl {
             ck(cudaMallocHost(&cpu_out_h, sizeof(float) * c.n_expert_used * D), "pinned");
             cpu_out_d = dalloc<float>(static_cast<size_t>(c.n_expert_used) * D);
         }
+        pred_ids_d = dalloc<int>(64); pred_w_d = dalloc<float>(64); pred_logit = dalloc<float>(c.n_expert);
         if (dp4a) {
             ck(cudaMallocHost(&plan_h, sizeof(cuda::ExpertPlan)), "pinned");
             plan_d = dalloc<cuda::ExpertPlan>(1);
@@ -656,6 +665,24 @@ struct Dsv41Engine::Impl {
         ck(cudaMemcpyAsync(hw.data(), wsel, K * 4, cudaMemcpyDeviceToHost, st), "w");
         ck(cudaStreamSynchronize(st), "router");
 
+        std::vector<int> next_pred;
+        if (pred_stats && il + 1 < c.n_layer) {
+            const std::string pn = "blk." + std::to_string(il + 1) + ".";
+            mv(pn + "ffn_gate_inp.weight", x, pred_logit);
+            cuda::dsv41::router_topk(pred_logit, V(pn + "exp_probs_b.bias"), c.n_expert, pred_k, 1.f, pred_ids_d, pred_w_d, st);
+            next_pred.resize(pred_k);
+            ck(cudaMemcpyAsync(next_pred.data(), pred_ids_d, pred_k * 4, cudaMemcpyDeviceToHost, st), "pred");
+            ck(cudaStreamSynchronize(st), "pred");
+        }
+        if (pred_stats && il > 0 && !pred_ids.empty()) {
+            for (int k = 0; k < K; ++k) {
+                const bool predicted = std::find(pred_ids.begin(), pred_ids.end(), hid[k]) != pred_ids.end();
+                ++pred_all; pred_all_hit += predicted;
+                const int key = il * c.n_expert + hid[k];
+                if (!where.count(key) && !ram->contains(key)) { ++pred_disk; pred_disk_hit += predicted; }
+            }
+        }
+        if (pred_stats) pred_ids = next_pred;
         if (hybrid) {
             moe_hybrid(il, hid, hw);
             shared_and_out(il);
@@ -1183,6 +1210,7 @@ void Dsv41Engine::reset_stats() {
     q.n_steps = 0;
     q.n_prefill = 0;
     q.hits = q.misses = q.cpu_experts = 0;
+    q.pred_disk = q.pred_disk_hit = q.pred_all = q.pred_all_hit = 0;
     if (q.ram) { q.ram->hits = q.ram->reads = 0; q.ram->read_s = 0; }
 }
 
@@ -1199,6 +1227,9 @@ std::string Dsv41Engine::report() const {
     if (q.hybrid)
         os << "; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
            << " ms (of it RAM tier / disk " << 1000.0 * q.t_ram / ns << " ms), then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms";
+    if (q.pred_stats)
+        os << "; next-layer prediction (top " << q.pred_k << "): " << 100.0 * q.pred_all_hit / std::max<uint64_t>(q.pred_all, 1)
+           << "% of all picks, " << 100.0 * q.pred_disk_hit / std::max<uint64_t>(q.pred_disk, 1) << "% of the " << q.pred_disk << " disk reads";
     if (q.ram)
         os << "; RAM tier: " << q.ram->hits << " hits, " << q.ram->reads << " disk reads in " << q.ram->read_s << " s ("
            << (q.ram->read_s > 0 ? q.ram->reads * 9.12e-3 / q.ram->read_s : 0.0) << " GB/s)";
