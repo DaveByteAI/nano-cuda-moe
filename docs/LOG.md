@@ -677,3 +677,19 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 - 已排除：AddressSanitizer 版本（主机代码全部插桩）完整跑通、没有报告；GPU 到主机的异步拷贝全部写锁页内存。
   还没查：GPU 核函数通过映射指针写主机内存时的越界、CPU 专家线程之间的竞争。
 - 考官遇到这种崩溃会重试一次，报告里记 `retried`。
+
+## 2026-10-18 dsv41 分支：DeepSeek-V4.1-Flash-1017（阶段 A，正确性优先）
+
+- 模型：acrogenesis 的 IQ2_XXS 专家 / Q8_0 稠密 / Q8_0 Engram 的 GGUF，revision `f5221b0`，10 个文件 359 GB
+  （`scripts/download_dsv41.sh`）。规格与公式全部写在 [DSV41.md](DSV41.md)，依据是官方 `inference/model.py`、`kernel.py`、
+  `engram.py`，与 llama.cpp PR #28696 逐条核对过。
+- 下载：两个代理都连不上（SSL 失败）。最快的办法是 hf-mirror 只请求一次 302 拿到 HF CDN 的签名地址，再对 CDN 开 16 个连接：
+  34–40 MiB/s；单连接约 6 MiB/s；对镜像本身开 16 个连接会被 429。镜像的 302 偶尔也回 429，脚本退避重试，不把镜像地址交给 aria2。
+- 参考实现：GitHub 直连约 25 KB/s，`git fetch` 反复卡死；通过 ghfast.top 取 PR commit `2076412` 的源码包（8 s），
+  tar 头的 commit id 一致，5 个关键文件与独立来源逐字节相同。CPU 版编出 `bl-ref-dump-dsv41`。
+- 校验：GGUF 里 Engram 的素数、偏移、乘数与 `engram.py` 的构造方法重算结果完全相同；`tests/test_dsv41_ops` 每个 kernel
+  对照参考公式的 CPU 实现，误差都在 fp32 舍入范围内（相对 1e-7 量级）。
+- 结构上值得记的点：RoPE 只转最后 64 维、相邻配对（llama.cpp `LLAMA_ROPE_TYPE_NORM`，转换时不重排权重）；YaRN 不乘
+  mscale；hc 系数滞后一个子层；只有 1 个 KV 头且 K = V；压缩 KV 与 indexer 只在源层计算、后面的层共用。
+- 字节预算：路由专家 140.14 GB（每 token 读 2.19 GB）、稠密加 output 8.94 GB（每 token 全读，840 GB/s 下约 10.6 ms 的下限）、
+  Engram 表 208.90 GB（每 token 48 行，几乎每行一个 4 KB 页）。
