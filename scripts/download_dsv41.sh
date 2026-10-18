@@ -80,4 +80,11 @@ for f in "${FILES[@]}"; do
   # the loader opens every part from the first file's directory
   if [ "$dir" != "$MODEL_DIR" ] && [ ! -e "$MODEL_DIR/$name" ]; then ln -s "$(realpath "$out")" "$MODEL_DIR/$name"; fi
 done
+# the official tokenizer (tools/dsv41_detok.py), from the original repository
+TOK=data/dsv41/tokenizer.json
+if [ ! -f "$TOK" ]; then
+  mkdir -p data/dsv41
+  env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    curl -fsL --retry 5 -o "$TOK" "$ENDPOINT/deepseek-ai/DeepSeek-V4.1-Flash-1017/resolve/main/tokenizer.json" || echo "tokenizer.json: download failed"
+fi
 echo "done: $WHAT"
