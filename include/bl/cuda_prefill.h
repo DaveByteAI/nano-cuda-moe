@@ -43,9 +43,9 @@ struct MoeItem {
 };
 // xg [A][D/32] q8_1 rows of the assignments' tokens, gathered from xq [N][D/32]
 void moe_gather(const void * xq, const int * tok, int A, int D, void * xg, cudaStream_t s);
-// act [A][F] = silu(gate . x) * (up . x)
+// act [A][F] = silu(gate . x) * (up . x); limit > 0 clamps first (gate at most limit, up within +-limit: DeepSeek-V4)
 void moe_gate_up(uint32_t type, const MoeItem * items, int n_items, size_t gu_bytes, int F, int D, const void * xg, float * act,
-                 cudaStream_t s);
+                 cudaStream_t s, float limit = 0.f);
 // h[tok[a]] += w[a] * (down . act[a])  (act quantized: actq [A][F/32]); atomics: the sum order varies
 void moe_down(uint32_t type, const MoeItem * items, int n_items, size_t gu_bytes, size_t d_rb, int F, int D, const void * actq,
               const int * tok, const float * w, float * h, cudaStream_t s);

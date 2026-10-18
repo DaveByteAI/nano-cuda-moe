@@ -19,6 +19,11 @@ namespace {
 
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
 __device__ __forceinline__ float silu(float x) { return x / (1.f + expf(-x)); }
+// lim > 0: DeepSeek-V4's clamps (gate at most lim, up within +-lim) before the SwiGLU
+__device__ __forceinline__ float swiglu_lim(float g, float u, float lim) {
+    if (lim > 0.f) { g = fminf(g, lim); u = fminf(fmaxf(u, -lim), lim); }
+    return silu(g) * u;
+}
 
 cublasHandle_t handle() {
     static cublasHandle_t h = [] {
@@ -261,7 +266,8 @@ constexpr int kMoeWarps = 8, kMoeNT = 16;   // the dp4a kernels' token tile
 // warp, the item's tokens at once
 constexpr int kGuL = 16;
 template <int F>
-__global__ void moe_gate_up_k(const MoeItem * items, size_t gu_bytes, int Fd, int D, const BlockQ8 * __restrict__ xg, float * act) {
+__global__ void moe_gate_up_k(const MoeItem * items, size_t gu_bytes, int Fd, int D, const BlockQ8 * __restrict__ xg, float * act,
+                              float lim) {
     const MoeItem it = items[blockIdx.y];
     const int lane = threadIdx.x & 31, sub = lane % kGuL;
     const int r = (blockIdx.x * kMoeWarps + (threadIdx.x >> 5)) * (32 / kGuL) + lane / kGuL;
@@ -283,7 +289,7 @@ __global__ void moe_gate_up_k(const MoeItem * items, size_t gu_bytes, int Fd, in
             gt += __shfl_xor_sync(0xffffffffu, gt, o);
             ut += __shfl_xor_sync(0xffffffffu, ut, o);
         }
-        if (sub == 0) act[static_cast<size_t>(it.a0 + t) * Fd + r] = silu(gt) * ut;
+        if (sub == 0) act[static_cast<size_t>(it.a0 + t) * Fd + r] = swiglu_lim(gt, ut, lim);
     }
 }
 
@@ -337,7 +343,7 @@ __device__ __forceinline__ void load_acts(const BlockQ8 * x, int n, int nb, int 
 // grid (Fd / 64, items), 128 threads: gate and up of 64 rows for the item's tokens; act = silu(gate) * up
 template <int F>
 __global__ void __launch_bounds__(128) moe_gu_mma_k(const MoeItem * items, size_t gu_bytes, int Fd, int D, const BlockQ8 * __restrict__ xg,
-                                                    float * act) {
+                                                    float * act, float lim) {
     const MoeItem it = items[blockIdx.y];
     const int r0 = blockIdx.x * kMmaRows, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
     const size_t rb = gu_bytes / Fd;
@@ -387,7 +393,7 @@ __global__ void __launch_bounds__(128) moe_gu_mma_k(const MoeItem * items, size_
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const int t = nt * 8 + 2 * q + (e & 1), r = r0 + (e < 2 ? ra : rc);
-            if (t < it.n) act[static_cast<size_t>(it.a0 + t) * Fd + r] = silu(acc[0][nt][e]) * acc[1][nt][e];
+            if (t < it.n) act[static_cast<size_t>(it.a0 + t) * Fd + r] = swiglu_lim(acc[0][nt][e], acc[1][nt][e], lim);
         }
     }
 }
@@ -465,15 +471,16 @@ void dispatch(uint32_t t, A... a) {
     }
 }
 template <int F> struct GateUp {
-    static void run(const MoeItem * items, int n, size_t gu, int Fd, int D, const void * xg, float * act, cudaStream_t s) {
+    static void run(const MoeItem * items, int n, size_t gu, int Fd, int D, const void * xg, float * act, cudaStream_t s,
+                    float lim) {
         static const bool dp4a = std::getenv("BL_MOE_DP4A") != nullptr;
         if (!dp4a && Fd % kMmaRows == 0) {
-            moe_gu_mma_k<F><<<dim3(Fd / kMmaRows, n), 128, 0, s>>>(items, gu, Fd, D, static_cast<const BlockQ8 *>(xg), act);
+            moe_gu_mma_k<F><<<dim3(Fd / kMmaRows, n), 128, 0, s>>>(items, gu, Fd, D, static_cast<const BlockQ8 *>(xg), act, lim);
             return;
         }
         constexpr int rpb = kMoeWarps * (32 / kGuL);
         moe_gate_up_k<F><<<dim3((Fd + rpb - 1) / rpb, n), 32 * kMoeWarps, 0, s>>>(items, gu, Fd, D,
-                                                                                            static_cast<const BlockQ8 *>(xg), act);
+                                                                                            static_cast<const BlockQ8 *>(xg), act, lim);
     }
 };
 template <int F> struct Down {
@@ -590,8 +597,8 @@ void moe_gather(const void * xq, const int * tok, int A, int D, void * xg, cudaS
         static_cast<const BlockQ8 *>(xq), tok, A, nb, static_cast<BlockQ8 *>(xg));
 }
 void moe_gate_up(uint32_t type, const MoeItem * items, int n_items, size_t gu_bytes, int F, int D, const void * xg, float * act,
-                 cudaStream_t s) {
-    if (n_items) dispatch<GateUp>(type, items, n_items, gu_bytes, F, D, xg, act, s);
+                 cudaStream_t s, float limit) {
+    if (n_items) dispatch<GateUp>(type, items, n_items, gu_bytes, F, D, xg, act, s, limit);
 }
 void moe_down(uint32_t type, const MoeItem * items, int n_items, size_t gu_bytes, size_t d_rb, int F, int D, const void * actq,
               const int * tok, const float * w, float * h, cudaStream_t s) {
