@@ -9,7 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <map>
+#include <unordered_map>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -96,7 +98,14 @@ struct Dsv41Engine::Impl {
     int * ids = nullptr, * win_idx = nullptr, * topk_idx = nullptr;
     float * emb = nullptr, * ekv = nullptr;
     uint8_t * erows = nullptr, * erows_h = nullptr;
-    uint8_t * xstage = nullptr;                            // 6 experts' [gate | up | down]
+    // routed experts in VRAM: an LRU cache of slots, each one expert's [gate | up | down]; misses come from the mapped
+    // file (page cache or disk). BL_DSV41_CACHE_GB sets its size (default: what is free after everything else, - 1.5 GB)
+    uint8_t * xslots = nullptr;
+    int n_slots = 0;
+    std::vector<int> slot_key;                              // (layer * n_expert + expert) held by each slot, -1 free
+    std::unordered_map<int, std::list<int>::iterator> where;
+    std::list<int> lru;                                     // slots, most recently used first
+    uint64_t hits = 0, misses = 0;
     float * logits_d = nullptr;
     std::vector<float *> win;                               // per layer [window][head_dim] ring
     std::vector<float *> comp_kv, idx_keys;                 // per source layer: [max_ctx / ratio][...]
@@ -263,7 +272,6 @@ struct Dsv41Engine::Impl {
         ekv = dalloc<float>(static_cast<size_t>(c.hc + 1) * D);
         erows = dalloc<uint8_t>(static_cast<size_t>(ncol) * std::max<size_t>(engram_row_bytes, 1));
         ck(cudaMallocHost(&erows_h, static_cast<size_t>(ncol) * std::max<size_t>(engram_row_bytes, 1)), "pinned");
-        xstage = dalloc<uint8_t>(static_cast<size_t>(c.n_expert_used) * (2 * gu_expert_bytes + d_expert_bytes));
         logits_d = dalloc<float>(c.n_vocab);
         logits.resize(c.n_vocab);
 
@@ -280,6 +288,45 @@ struct Dsv41Engine::Impl {
             if (c.owns_idx_key(il)) idx_keys[il] = dalloc<float>(static_cast<size_t>(max_ctx / c.compress_ratio[il] + 1) * c.idx_dim);
         }
         ck(cudaDeviceSynchronize(), "load");
+
+        // the expert cache takes the rest of VRAM
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        size_t fr = 0, to = 0;
+        ck(cudaMemGetInfo(&fr, &to), "cudaMemGetInfo");
+        size_t want = fr > (3ull << 29) ? fr - (3ull << 29) : 0;
+        if (const char * e = std::getenv("BL_DSV41_CACHE_GB")) want = std::min(want, static_cast<size_t>(std::atof(e) * (1ull << 30)));
+        n_slots = std::max(static_cast<int>(want / per), c.n_expert_used);
+        xslots = dalloc<uint8_t>(static_cast<size_t>(n_slots) * per);
+        slot_key.assign(n_slots, -1);
+        for (int i = 0; i < n_slots; ++i) lru.push_back(i);
+        std::fprintf(stderr, "dsv41: expert cache %d slots (%.1f GB, %.1f%% of all experts)\n", n_slots,
+                     static_cast<double>(n_slots) * per / 1e9, 100.0 * n_slots / (static_cast<double>(c.n_layer) * c.n_expert));
+    }
+
+    // the VRAM slot holding expert e of layer il; copied in on a miss. Slots used in this layer stay put: the LRU
+    // tail is never one of them because they were just moved to the front.
+    uint8_t * expert_slot(int il, int e) {
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        const int key = il * c.n_expert + e;
+        auto it = where.find(key);
+        if (it != where.end()) {
+            ++hits;
+            lru.splice(lru.begin(), lru, it->second);
+            return xslots + static_cast<size_t>(*it->second) * per;
+        }
+        ++misses;
+        const int slot = lru.back();
+        lru.pop_back();
+        if (slot_key[slot] >= 0) where.erase(slot_key[slot]);
+        slot_key[slot] = key;
+        lru.push_front(slot);
+        where[key] = lru.begin();
+        uint8_t * dst = xslots + static_cast<size_t>(slot) * per;
+        const size_t ee = static_cast<size_t>(e);
+        ck(cudaMemcpyAsync(dst, experts[il].gate + ee * gu_expert_bytes, gu_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
+        ck(cudaMemcpyAsync(dst + gu_expert_bytes, experts[il].up + ee * gu_expert_bytes, gu_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
+        ck(cudaMemcpyAsync(dst + 2 * gu_expert_bytes, experts[il].down + ee * d_expert_bytes, d_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
+        return dst;
     }
 
     ~Impl() {
@@ -423,20 +470,14 @@ struct Dsv41Engine::Impl {
         ck(cudaStreamSynchronize(st), "router");
 
         const auto t0 = std::chrono::steady_clock::now();
-        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
-        for (int k = 0; k < K; ++k) {   // the experts from the mapped file (page cache or disk)
-            const size_t e = static_cast<size_t>(hid[k]);
-            uint8_t * dst = xstage + k * per;
-            ck(cudaMemcpyAsync(dst, experts[il].gate + e * gu_expert_bytes, gu_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
-            ck(cudaMemcpyAsync(dst + gu_expert_bytes, experts[il].up + e * gu_expert_bytes, gu_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
-            ck(cudaMemcpyAsync(dst + 2 * gu_expert_bytes, experts[il].down + e * d_expert_bytes, d_expert_bytes, cudaMemcpyHostToDevice, st), "expert");
-        }
+        std::vector<const uint8_t *> base_k(K);
+        for (int k = 0; k < K; ++k) base_k[k] = expert_slot(il, hid[k]);
         ck(cudaStreamSynchronize(st), "experts");
         t_expert_copy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
         ck(cudaMemsetAsync(moe, 0, D * 4, st), "moe");
         for (int k = 0; k < K; ++k) {
-            const uint8_t * base = xstage + k * per;
+            const uint8_t * base = base_k[k];
             cuda::matvec(expert_type, base, gu_row_bytes, F, D, x, gbuf, st);
             cuda::matvec(expert_type, base + gu_expert_bytes, gu_row_bytes, F, D, x, ubuf, st);
             cuda::dsv41::swiglu_clamp(gbuf, ubuf, abuf, F, lim, st);
@@ -543,7 +584,9 @@ std::string Dsv41Engine::report() const {
     const auto & q = *p_;
     if (q.n_steps == 0) return "no steps";
     os << q.n_steps << " steps, " << 1000.0 * q.t_total / q.n_steps << " ms/token (expert copies "
-       << 1000.0 * q.t_expert_copy / q.n_steps << " ms, Engram rows " << 1000.0 * q.t_engram / q.n_steps << " ms)";
+       << 1000.0 * q.t_expert_copy / q.n_steps << " ms, Engram rows " << 1000.0 * q.t_engram / q.n_steps << " ms); "
+       << "expert cache hit rate " << (q.hits + q.misses ? 100.0 * q.hits / (q.hits + q.misses) : 0.0) << "% of "
+       << q.hits + q.misses;
     return os.str();
 }
 
