@@ -98,4 +98,13 @@ if(BL_ENABLE_CUDA)
   # the reference dumper: llama.cpp's own forward pass, layer by layer (CPU-only here; slow on the full model)
   add_executable(bl-ref-dump tools/ref_dump.cpp)
   target_link_libraries(bl-ref-dump PRIVATE llama ggml)
+
+  # DeepSeek-V4.1-Flash (deepseek41), phase A: docs/DSV41.md
+  add_library(bl_dsv41 STATIC src/dsv41/config.cpp src/dsv41/ops.cu src/dsv41/engine.cpp)
+  target_include_directories(bl_dsv41 PUBLIC include)
+  target_link_libraries(bl_dsv41 PUBLIC bl_cuda)
+  add_executable(bl-dsv41 tools/bl_dsv41.cpp)
+  target_link_libraries(bl-dsv41 PRIVATE bl_dsv41)
+  add_executable(test_dsv41_ops tests/test_dsv41_ops.cu)
+  target_link_libraries(test_dsv41_ops PRIVATE bl_dsv41)
 endif()
