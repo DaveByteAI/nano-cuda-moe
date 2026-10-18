@@ -121,6 +121,18 @@ struct Dsv41Engine::Impl {
     std::unordered_map<int, std::list<int>::iterator> where;
     std::list<int> lru;                                     // slots, most recently used first
     uint64_t hits = 0, misses = 0;
+    // admissions (hybrid decode) copy on their own stream so the compute stream does not queue behind them; a slot
+    // whose copy may still be running carries its event, and the compute stream waits on it before the first use
+    cudaStream_t cst = nullptr;
+    std::vector<cudaEvent_t> slot_ready;
+    std::vector<char> slot_pending;
+    cudaEvent_t ev_compute = nullptr, ev_admit = nullptr;   // compute stream's progress / the last admission
+    bool admit_pending = false;
+    void use_slot(int slot) {
+        if (!slot_pending[slot]) return;
+        ck(cudaStreamWaitEvent(st, slot_ready[slot], 0), "wait admission");
+        slot_pending[slot] = 0;
+    }
     // BL_DSV41_DP4A=1: the experts through the decode pipeline's dp4a kernels (q8_1 activations, 2.6x faster);
     // default the fp32 matvec, exact against a double reference (for the comparisons with llama.cpp)
     bool dp4a = std::getenv("BL_DSV41_DP4A") && std::atoi(std::getenv("BL_DSV41_DP4A")) != 0;
@@ -402,6 +414,12 @@ struct Dsv41Engine::Impl {
         n_slots = std::max(static_cast<int>(want / per), c.n_expert_used);
         xslots = dalloc<uint8_t>(static_cast<size_t>(n_slots) * per);
         slot_key.assign(n_slots, -1);
+        ck(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking), "copy stream");
+        slot_ready.assign(n_slots, nullptr);
+        slot_pending.assign(n_slots, 0);
+        for (auto & e : slot_ready) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+        ck(cudaEventCreateWithFlags(&ev_compute, cudaEventDisableTiming), "event");
+        ck(cudaEventCreateWithFlags(&ev_admit, cudaEventDisableTiming), "event");
         for (int i = 0; i < n_slots; ++i) lru.push_back(i);
         std::fprintf(stderr, "dsv41: expert cache %d slots (%.1f GB, %.1f%% of all experts)\n", n_slots,
                      static_cast<double>(n_slots) * per / 1e9, 100.0 * n_slots / (static_cast<double>(c.n_layer) * c.n_expert));
@@ -424,6 +442,30 @@ struct Dsv41Engine::Impl {
         }
     }
 
+    // expert e of layer il into a VRAM slot on the copy stream (hybrid decode's admissions)
+    void admit_expert(int il, int e) {
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        const int key = il * c.n_expert + e;
+        if (where.count(key)) return;
+        const int slot = lru.back();
+        lru.pop_back();
+        if (slot_key[slot] >= 0) where.erase(slot_key[slot]);
+        slot_key[slot] = key;
+        lru.push_front(slot);
+        where[key] = lru.begin();
+        const uint8_t * src = nullptr;
+        ram_get(il, &e, 1, &src);
+        // the evicted expert may still be read by queued compute: the copy waits for it
+        ck(cudaEventRecord(ev_compute, st), "event");
+        ck(cudaStreamWaitEvent(cst, ev_compute, 0), "wait compute");
+        if (slot_pending[slot]) ck(cudaStreamWaitEvent(cst, slot_ready[slot], 0), "wait admission");
+        ck(cudaMemcpyAsync(xslots + static_cast<size_t>(slot) * per, src, per, cudaMemcpyHostToDevice, cst), "admit");
+        ck(cudaEventRecord(slot_ready[slot], cst), "event");
+        ck(cudaEventRecord(ev_admit, cst), "event");
+        slot_pending[slot] = 1;
+        admit_pending = true;
+    }
+
     ExpertRam::Src src_of(int il, int e) const {
         ExpertRam::Src s{};
         const size_t len[3] = {gu_expert_bytes, gu_expert_bytes, d_expert_bytes};
@@ -439,6 +481,10 @@ struct Dsv41Engine::Impl {
         std::vector<int> keys(n);
         std::vector<ExpertRam::Src> src(n);
         for (int i = 0; i < n; ++i) { keys[i] = il * c.n_expert + e[i]; src[i] = src_of(il, e[i]); }
+        if (admit_pending) {   // an admission copy may still read a RAM slot this fetch could evict
+            ck(cudaEventSynchronize(ev_admit), "admission");
+            admit_pending = false;
+        }
         ram->fetch(keys.data(), src.data(), n, out);
     }
 
@@ -451,10 +497,12 @@ struct Dsv41Engine::Impl {
         if (it != where.end()) {
             ++hits;
             lru.splice(lru.begin(), lru, it->second);
+            use_slot(*it->second);
             return xslots + static_cast<size_t>(*it->second) * per;
         }
         ++misses;
         const int slot = lru.back();
+        use_slot(slot);   // a pending admission into the slot being reused finishes first
         lru.pop_back();
         if (slot_key[slot] >= 0) where.erase(slot_key[slot]);
         slot_key[slot] = key;
@@ -469,6 +517,10 @@ struct Dsv41Engine::Impl {
 
     ~Impl() {
         if (st) cudaStreamSynchronize(st);
+        if (cst) { cudaStreamSynchronize(cst); cudaStreamDestroy(cst); }
+        for (auto e : slot_ready) if (e) cudaEventDestroy(e);
+        if (ev_compute) cudaEventDestroy(ev_compute);
+        if (ev_admit) cudaEventDestroy(ev_admit);
         for (void * p : allocs) cudaFree(p);
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
@@ -666,6 +718,7 @@ struct Dsv41Engine::Impl {
             if (it != where.end()) {
                 ++hits;
                 lru.splice(lru.begin(), lru, it->second);
+                use_slot(*it->second);
                 gk.push_back(k);
                 gbase.push_back(xslots + static_cast<size_t>(*it->second) * (2 * gu_expert_bytes + d_expert_bytes));
             } else {
@@ -708,10 +761,7 @@ struct Dsv41Engine::Impl {
             ck(cudaMemcpyAsync(cpu_out_d, cpu_out_h, sizeof(float) * n * D, cudaMemcpyHostToDevice, st), "cpu out");
             for (int j = 0; j < n; ++j) cuda::axpy(moe, cpu_out_d + static_cast<size_t>(j) * D, hw[ck_[j]], D, st);
             // admit a few: their pages are hot now, so the copies come from RAM
-            for (int j = 0; j < std::min(n, admit); ++j) {
-                expert_slot(il, hid[ck_[j]]);
-                --misses;   // expert_slot counted a miss for what was already counted above
-            }
+            for (int j = 0; j < std::min(n, admit); ++j) admit_expert(il, hid[ck_[j]]);
         }
         const auto t1 = std::chrono::steady_clock::now();
         ck(cudaStreamSynchronize(st), "moe");   // cpu_out_h is rewritten by the next layer

@@ -64,41 +64,38 @@ __global__ void hc_split_k(const float * m, const float * R, const float * scale
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += R[i] * R[i];
     ss = block_sum(ss);
-    if (threadIdx.x != 0) return;
+    // warp 0, lane l = j * hc + k holds comb element (j, k) in a register (hc a power of two, hc * hc <= 32):
+    // a row's elements are hc neighbouring lanes (xor 1 .. hc/2), a column's are hc apart (xor hc .. hc*hc/2)
+    if (threadIdx.x >= 32) return;
+    const int l = threadIdx.x, j = l / hc, k = l % hc, nn = hc * hc;
     const float r = rsqrtf(ss / n + norm_eps);
-    for (int j = 0; j < hc; ++j) {
-        pre[j]  = 1.f / (1.f + expf(-(m[j] * r * scale[0] + base[j]))) + hc_eps;
-        post[j] = 2.f / (1.f + expf(-(m[hc + j] * r * scale[1] + base[hc + j])));
+    if (l < hc) {
+        pre[l]  = 1.f / (1.f + expf(-(m[l] * r * scale[0] + base[l]))) + hc_eps;
+        post[l] = 2.f / (1.f + expf(-(m[hc + l] * r * scale[1] + base[hc + l])));
     }
-    float c[8][8];   // hc <= 8
-    for (int j = 0; j < hc; ++j)
-        for (int k = 0; k < hc; ++k) c[j][k] = m[2 * hc + j * hc + k] * r * scale[2] + base[2 * hc + j * hc + k];
-    // softmax over each row, + eps
-    for (int j = 0; j < hc; ++j) {
-        float mx = -FLT_MAX;
-        for (int k = 0; k < hc; ++k) mx = fmaxf(mx, c[j][k]);
-        float s = 0.f;
-        for (int k = 0; k < hc; ++k) s += (c[j][k] = expf(c[j][k] - mx));
-        for (int k = 0; k < hc; ++k) c[j][k] = c[j][k] / s + hc_eps;
-    }
-    auto cols = [&]() {
-        for (int k = 0; k < hc; ++k) {
-            float s = 0.f;
-            for (int j = 0; j < hc; ++j) s += c[j][k];
-            for (int j = 0; j < hc; ++j) c[j][k] /= s + hc_eps;
+    const bool on = l < nn;
+    float c = on ? m[2 * hc + l] * r * scale[2] + base[2 * hc + l] : 0.f;
+    auto row_reduce = [&](float v, bool is_max) {
+        for (int o = 1; o < hc; o <<= 1) {
+            const float w = __shfl_xor_sync(0xffffffffu, v, o);
+            v = is_max ? fmaxf(v, w) : v + w;
         }
+        return v;
     };
-    cols();
+    auto col_sum = [&](float v) {
+        for (int o = hc; o < nn; o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        return v;
+    };
+    // softmax over each row, + eps
+    const float mx = row_reduce(on ? c : -FLT_MAX, true);
+    const float e = on ? expf(c - mx) : 0.f;
+    c = on ? e / row_reduce(e, false) + hc_eps : 0.f;
+    c = on ? c / (col_sum(c) + hc_eps) : 0.f;
     for (int it = 1; it < iters; ++it) {
-        for (int j = 0; j < hc; ++j) {
-            float s = 0.f;
-            for (int k = 0; k < hc; ++k) s += c[j][k];
-            for (int k = 0; k < hc; ++k) c[j][k] /= s + hc_eps;
-        }
-        cols();
+        c = on ? c / (row_reduce(c, false) + hc_eps) : 0.f;
+        c = on ? c / (col_sum(c) + hc_eps) : 0.f;
     }
-    for (int j = 0; j < hc; ++j)
-        for (int k = 0; k < hc; ++k) comb[j * hc + k] = c[j][k];
+    if (on) comb[j * hc + k] = c;
 }
 
 __global__ void hc_pre_k(const float * R, const float * pre, float * out, int hc, int D) {
