@@ -76,6 +76,9 @@ public:
 
     // feeds one token at position(); returns the logits ([n_vocab])
     const std::vector<float> & step(int token);
+    // feeds a prompt in chunks, each layer over a whole chunk (weights read once per chunk); returns the last
+    // position's logits, and every position's ([n][n_vocab]) into all when given. Same state as stepping each token.
+    const std::vector<float> & prefill(const std::vector<int> & tokens, std::vector<float> * all = nullptr);
 
     // name ("attn_norm-12", ...), device pointer to n floats; called synchronously in forward order
     using Probe = std::function<void(const std::string & name, const float * dev, int n)>;

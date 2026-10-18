@@ -24,6 +24,7 @@
 #include "bl/cpu_experts.h"
 #include "bl/cuda_ops.h"
 #include "bl/cuda_pipeline.h"
+#include "bl/cuda_prefill.h"
 #include "bl/cuda_quant.h"
 #include "bl/dsv41_ops.h"
 
@@ -132,6 +133,22 @@ struct Dsv41Engine::Impl {
     std::vector<float *> cst_kv, cst_sc;                    // per ratio-2 source: the pending group [2][head_dim]
     std::vector<float *> engram_qk;                         // per engram layer [hc][D]
     float * freq_swa = nullptr, * freq_comp = nullptr;
+
+    // prefill: chunks of up to kChunk tokens through the whole model, layer by layer (weights read once per chunk)
+    static constexpr int kChunk = 64;
+    struct Pf {
+        float * R, * R2, * mix, * pre, * a_pre, * post, * comb, * x, * qr, * q, * kv, * o, * og, * oa, * ao;
+        float * win, * ckv, * csc, * lat, * ik, * iq, * iw, * isc, * logit_e, * w, * moe, * g, * u, * a, * sh, * ffo;
+        float * emb, * ekv, * act, * gscratch, * logits;
+        int * ids, * a0, * na, * nb, * nvis, * topk, * tok, * win_ids;
+        float * wa;
+        void * xq, * xg, * actq;
+        cuda::MoeItem * items;
+        uint8_t * erows;
+        uint8_t * erows_h;
+        size_t gscratch_floats;
+    } pf{};
+    std::vector<int> pf_nb;                                 // the current top-k counts per chunk token (host)
 
     std::vector<int> toks;                                  // every token fed so far
     std::vector<float> logits;
@@ -324,6 +341,36 @@ struct Dsv41Engine::Impl {
             pact = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * c.n_ff_exp);
             pout = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * D);
         }
+        {   // prefill buffers (before the expert cache, which takes the rest)
+            const size_t T = kChunk, HQ = static_cast<size_t>(H) * HD, A = T * c.n_expert_used;
+            pf.R = dalloc<float>(T * c.hc_dim()); pf.R2 = dalloc<float>(T * c.hc_dim());
+            pf.mix = dalloc<float>(T * c.hc_mix()); pf.pre = dalloc<float>(T * c.hc); pf.a_pre = dalloc<float>(T * c.hc);
+            pf.post = dalloc<float>(T * c.hc); pf.comb = dalloc<float>(T * c.hc * c.hc);
+            pf.x = dalloc<float>(T * D); pf.qr = dalloc<float>(T * c.q_lora); pf.q = dalloc<float>(T * HQ);
+            pf.kv = dalloc<float>(T * HD); pf.o = dalloc<float>(T * HQ); pf.og = dalloc<float>(T * HQ / c.o_groups);
+            pf.oa = dalloc<float>(T * c.o_groups * c.o_lora); pf.ao = dalloc<float>(T * D);
+            pf.win = dalloc<float>((T + c.window) * HD);
+            pf.ckv = dalloc<float>((T + 1) * HD); pf.csc = dalloc<float>((T + 1) * HD);
+            pf.lat = dalloc<float>(T * HD); pf.ik = dalloc<float>(T * c.idx_dim);
+            pf.iq = dalloc<float>(T * c.idx_heads * c.idx_dim); pf.iw = dalloc<float>(T * c.idx_heads);
+            pf.isc = dalloc<float>(T * static_cast<size_t>(max_ctx));
+            pf.logit_e = dalloc<float>(T * c.n_expert); pf.w = dalloc<float>(A); pf.ids = dalloc<int>(A);
+            pf.moe = dalloc<float>(T * D); pf.g = dalloc<float>(T * c.n_ff_exp); pf.u = dalloc<float>(T * c.n_ff_exp);
+            pf.a = dalloc<float>(T * c.n_ff_exp); pf.sh = dalloc<float>(T * D); pf.ffo = dalloc<float>(T * D);
+            pf.emb = dalloc<float>(T * c.engram_cols() * c.engram_dim); pf.ekv = dalloc<float>(T * (c.hc + 1) * D);
+            pf.act = dalloc<float>(A * c.n_ff_exp);
+            pf.a0 = dalloc<int>(T); pf.na = dalloc<int>(T); pf.nb = dalloc<int>(T); pf.nvis = dalloc<int>(T);
+            pf.topk = dalloc<int>(T * c.idx_top_k); pf.tok = dalloc<int>(A); pf.wa = dalloc<float>(A);
+            pf.win_ids = dalloc<int>(c.window);
+            pf.xq = dalloc<uint8_t>(cuda::q8_bytes(D) * T); pf.xg = dalloc<uint8_t>(cuda::q8_bytes(D) * A);
+            pf.actq = dalloc<uint8_t>(cuda::q8_bytes(c.n_ff_exp) * A);
+            pf.items = dalloc<cuda::MoeItem>(A);
+            pf.erows = dalloc<uint8_t>(T * c.engram_cols() * std::max<size_t>(engram_row_bytes, 1));
+            ck(cudaMallocHost(&pf.erows_h, T * c.engram_cols() * std::max<size_t>(engram_row_bytes, 1)), "pinned");
+            pf.gscratch_floats = size_t{16} << 20;   // 64 MB: gemm_w dequantizes a weight matrix into it, block by block
+            pf.gscratch = dalloc<float>(pf.gscratch_floats);
+            pf.logits = nullptr;                      // all-position logits only when asked (allocated then)
+        }
         // the expert cache takes the rest of VRAM
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
         size_t fr = 0, to = 0;
@@ -369,6 +416,7 @@ struct Dsv41Engine::Impl {
         for (void * p : allocs) cudaFree(p);
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
+        if (pf.erows_h) cudaFreeHost(pf.erows_h);
         if (x_h) cudaFreeHost(x_h);
         if (cpu_out_h) cudaFreeHost(cpu_out_h);
         if (st) cudaStreamDestroy(st);
@@ -616,6 +664,310 @@ struct Dsv41Engine::Impl {
         t_gpu_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     }
 
+    // y [N][M] = x [N][K] . W^T for the named matrix
+    void gemm(const std::string & n, const float * in, int N, float * out, int ldy = -1) {
+        const Mat & m = M(n);
+        cuda::gemm_w(m.type, m.d, m.row_bytes, m.M, m.K, in, N, out, ldy < 0 ? m.M : ldy, pf.gscratch, pf.gscratch_floats, st);
+    }
+    void norm_rows(float * xin, int rows, int D, const std::string & w) {
+        cuda::rmsnorm_rows(xin, xin, rows, D, V(w), 1, static_cast<float>(c.rms_eps), 1.f, st);
+    }
+    template <typename T> void up(T * dst, const std::vector<T> & v) {
+        ck(cudaMemcpyAsync(dst, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice, st), "upload");
+    }
+
+    // T tokens at positions pos0.. (all already in toks), through every layer; logits of every position into
+    // pf.logits when all_logits, else only the last one into logits_d
+    void prefill_chunk(int pos0, int T, bool all_logits) {
+        const int D = c.n_embd, hc = c.hc, HD = c.head_dim, H = c.n_head, rd = c.rope_dims;
+        const float eps = static_cast<float>(c.rms_eps), hc_eps = static_cast<float>(c.hc_eps);
+        // embeddings, repeated into the hc copies; the one-hot pre mix for layer 0
+        {
+            std::vector<float> e(static_cast<size_t>(T) * D);
+            for (int t = 0; t < T; ++t) {
+                const uint8_t * row = embd + static_cast<size_t>(toks[pos0 + t]) * D * 2;
+                for (int i = 0; i < D; ++i) {
+                    uint16_t v;
+                    std::memcpy(&v, row + 2 * i, 2);
+                    e[static_cast<size_t>(t) * D + i] = bf16_to_float(v);
+                }
+            }
+            up(pf.x, e);
+            for (int t = 0; t < T; ++t) cuda::repeat(pf.x + static_cast<size_t>(t) * D, pf.R + static_cast<size_t>(t) * c.hc_dim(), D, hc, st);
+            std::vector<float> one(static_cast<size_t>(T) * hc, 0.f);
+            for (int t = 0; t < T; ++t) one[static_cast<size_t>(t) * hc] = 1.f;
+            up(pf.pre, one);
+            ck(cudaStreamSynchronize(st), "embd");
+        }
+        // Engram rows of every chunk token, all reads started together
+        const int ncol = c.engram_cols();
+        std::vector<uint64_t> erow(static_cast<size_t>(T) * c.engram_layers.size() * ncol);
+        if (engram_on) {
+            const long pg = sysconf(_SC_PAGESIZE);
+            for (int t = 0; t < T; ++t) {
+                uint64_t * r = erow.data() + static_cast<size_t>(t) * c.engram_layers.size() * ncol;
+                dsv41_engram_rows(c, toks.data(), pos0 + t, r);
+                for (size_t e = 0; e < c.engram_layers.size(); ++e)
+                    for (int b = 0; b < ncol; ++b) {
+                        const uint8_t * a = engram_table[e] + r[e * ncol + b] * engram_row_bytes;
+                        const uintptr_t pa = reinterpret_cast<uintptr_t>(a) & ~static_cast<uintptr_t>(pg - 1);
+                        madvise(reinterpret_cast<void *>(pa), engram_row_bytes + (reinterpret_cast<uintptr_t>(a) - pa), MADV_WILLNEED);
+                    }
+            }
+        }
+        // per-position counts the attention needs (host-known): window range in pf.win, visible compressed entries
+        const int W0 = std::min(pos0, c.window - 1);   // earlier raw KV the first query sees
+        std::vector<int> a0(T), na(T);
+        for (int t = 0; t < T; ++t) {
+            const int p = pos0 + t, first = std::max(0, p - c.window + 1);
+            a0[t] = first - (pos0 - W0);
+            na[t] = p - first + 1;
+        }
+        up(pf.a0, a0);
+        up(pf.na, na);
+        const int na_max = *std::max_element(na.begin(), na.end());
+        pf_nb.assign(T, 0);
+
+        for (int il = 0; il < c.n_layer; ++il) {
+            const std::string p = "blk." + std::to_string(il) + ".";
+            const int eg = c.engram_index(il);
+            if (eg >= 0 && engram_on) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int t = 0; t < T; ++t)
+                    for (int b = 0; b < ncol; ++b) {
+                        const uint64_t r = erow[(static_cast<size_t>(t) * c.engram_layers.size() + eg) * ncol + b];
+                        std::memcpy(pf.erows_h + (static_cast<size_t>(t) * ncol + b) * engram_row_bytes,
+                                    engram_table[eg] + r * engram_row_bytes, engram_row_bytes);
+                    }
+                t_engram += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                ck(cudaMemcpyAsync(pf.erows, pf.erows_h, static_cast<size_t>(T) * ncol * engram_row_bytes, cudaMemcpyHostToDevice, st), "rows");
+                cuda::dequant_rows(8 /* Q8_0 */, pf.erows, engram_row_bytes, T * ncol, c.engram_dim, pf.emb, st);
+                gemm(p + "engram_wkv.weight", pf.emb, T, pf.ekv);
+                cuda::dsv41::engram_gate_rows(pf.R, pf.ekv, engram_qk[eg], hc, D, T, eps, st);
+            }
+
+            // ---- attention sublayer
+            gemm(p + "hc_attn_fn.weight", pf.R, T, pf.mix);
+            cuda::dsv41::hc_split_rows(pf.mix, pf.R, V(p + "hc_attn_scale.weight"), V(p + "hc_attn_base.weight"), hc, D, T, eps, hc_eps,
+                                       c.hc_sinkhorn, pf.a_pre, pf.post, pf.comb, st);
+            cuda::dsv41::hc_pre_rows(pf.R, pf.pre, pf.x, hc, D, T, st);
+            norm_rows(pf.x, T, D, p + "attn_norm.weight");
+            attention_chunk(il, pos0, T, W0, na_max);
+            cuda::dsv41::hc_post_rows(pf.ao, pf.R, pf.post, pf.comb, pf.R2, hc, D, T, st);
+            std::swap(pf.R, pf.R2);
+
+            // ---- FFN sublayer
+            gemm(p + "hc_ffn_fn.weight", pf.R, T, pf.mix);
+            cuda::dsv41::hc_split_rows(pf.mix, pf.R, V(p + "hc_ffn_scale.weight"), V(p + "hc_ffn_base.weight"), hc, D, T, eps, hc_eps,
+                                       c.hc_sinkhorn, pf.pre, pf.post, pf.comb, st);
+            cuda::dsv41::hc_pre_rows(pf.R, pf.a_pre, pf.x, hc, D, T, st);
+            norm_rows(pf.x, T, D, p + "ffn_norm.weight");
+            moe_chunk(il, T);
+            cuda::dsv41::hc_post_rows(pf.ffo, pf.R, pf.post, pf.comb, pf.R2, hc, D, T, st);
+            std::swap(pf.R, pf.R2);
+        }
+        cuda::dsv41::hc_pre_rows(pf.R, pf.pre, pf.x, hc, D, T, st);
+        norm_rows(pf.x, T, D, "output_norm.weight");
+        if (all_logits) gemm("output.weight", pf.x, T, pf.logits + static_cast<size_t>(pos0 - pf_logits_from) * c.n_vocab);
+        else mv("output.weight", pf.x + static_cast<size_t>(T - 1) * D, logits_d);
+        ck(cudaStreamSynchronize(st), "prefill chunk");
+        (void)rd; (void)HD; (void)H;
+    }
+    int pf_logits_from = 0;
+
+    void attention_chunk(int il, int pos0, int T, int W0, int na_max) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        const int HD = c.head_dim, H = c.n_head, rd = c.rope_dims, ratio = c.compress_ratio[il], D = c.n_embd;
+        const float * freq = ratio ? freq_comp : freq_swa;
+        gemm(p + "attn_q_a.weight", pf.x, T, pf.qr);
+        norm_rows(pf.qr, T, c.q_lora, p + "attn_q_a_norm.weight");
+        gemm(p + "attn_q_b.weight", pf.qr, T, pf.q);
+        cuda::dsv41::rope_tail_rows(pf.q, T, H, HD, rd, pos0, 1, freq, false, st);
+        // window keys: the W0 earlier positions from the ring, then this chunk's
+        if (W0 > 0) {
+            std::vector<int> ids(W0);
+            for (int i = 0; i < W0; ++i) ids[i] = (pos0 - W0 + i) % c.window;
+            up(pf.win_ids, ids);
+            cuda::gather_rows(win[il], static_cast<size_t>(HD) * 4, pf.win_ids, W0, pf.win, st);
+        }
+        float * kvc = pf.win + static_cast<size_t>(W0) * HD;
+        gemm(p + "attn_kv.weight", pf.x, T, kvc);
+        norm_rows(kvc, T, HD, p + "attn_kv_a_norm.weight");
+        cuda::dsv41::rope_tail_rows(kvc, T, 1, HD, rd, pos0, 1, freq, false, st);
+        // the ring keeps the last window of positions
+        for (int t = std::max(0, T - c.window); t < T; ++t)
+            ck(cudaMemcpyAsync(win[il] + static_cast<size_t>((pos0 + t) % c.window) * HD, kvc + static_cast<size_t>(t) * HD, HD * 4,
+                               cudaMemcpyDeviceToDevice, st), "ring");
+
+        int nb_max = 0;
+        const float * comp = pf.win;   // unused when no compressed keys
+        if (ratio > 0) {
+            if (c.is_kv_source(il)) compress_chunk(il, pos0, T);
+            comp = comp_kv[c.kv_source[il]];
+            if (c.is_topk_source(il)) topk_chunk(il, pos0, T);
+            for (int v : pf_nb) nb_max = std::max(nb_max, v);
+        } else {
+            std::vector<int> z(T, 0);
+            up(pf.nb, z);
+        }
+        cuda::dsv41::attention_sink_rows(pf.q, pf.win, pf.a0, pf.na, comp, pf.topk, c.idx_top_k, pf.nb, na_max + nb_max,
+                                         V(p + "attn_sinks.weight"), pf.o, H, HD, T, 1.f / std::sqrt(static_cast<float>(HD)), st);
+        if (ratio == 0) {   // the counts of the last top-k source stay for the layers after it; only zero them here
+            std::vector<int> nb(pf_nb);
+            up(pf.nb, nb);
+        }
+        cuda::dsv41::rope_tail_rows(pf.o, T, H, HD, rd, pos0, 1, freq, true, st);
+        const Mat & wa = M(p + "attn_output_a.weight");
+        const int gin = H * HD / c.o_groups;
+        for (int gi = 0; gi < c.o_groups; ++gi) {
+            cuda::copy_rows(pf.o + static_cast<size_t>(gi) * gin, H * HD, pf.og, gin, gin, T, st);
+            cuda::gemm_w(wa.type, static_cast<const uint8_t *>(wa.d) + wa.row_bytes * c.o_lora * gi, wa.row_bytes, c.o_lora, wa.K, pf.og,
+                         T, pf.oa + static_cast<size_t>(gi) * c.o_lora, c.o_groups * c.o_lora, pf.gscratch, pf.gscratch_floats, st);
+        }
+        gemm(p + "attn_output_b.weight", pf.oa, T, pf.ao);
+        (void)D;
+    }
+
+    void compress_chunk(int il, int pos0, int T) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        const int HD = c.head_dim, ratio = c.compress_ratio[il], rd = c.rope_dims;
+        int n = 0, j0 = 0;   // latents produced, the first one's index
+        if (ratio == 1) {
+            gemm(p + "attn_compressor_kv.weight", pf.x, T, pf.lat);
+            n = T;
+            j0 = pos0;
+        } else {   // ratio 2: a pending token from before the chunk (odd pos0) pairs with the chunk's first
+            const int s0 = pos0 % 2;
+            if (s0) {
+                ck(cudaMemcpyAsync(pf.ckv, cst_kv[il], HD * 4, cudaMemcpyDeviceToDevice, st), "pending");
+                ck(cudaMemcpyAsync(pf.csc, cst_sc[il], HD * 4, cudaMemcpyDeviceToDevice, st), "pending");
+            }
+            gemm(p + "attn_compressor_kv.weight", pf.x, T, pf.ckv + static_cast<size_t>(s0) * HD);
+            gemm(p + "attn_compressor_gate.weight", pf.x, T, pf.csc + static_cast<size_t>(s0) * HD);
+            n = (s0 + T) / 2;
+            j0 = (pos0 - s0) / 2;
+            cuda::dsv41::pool2_rows(pf.ckv, pf.csc, pf.lat, HD, n, st);
+            if ((s0 + T) % 2) {   // the chunk's last token waits for its partner (slot 0: its position is even)
+                ck(cudaMemcpyAsync(cst_kv[il], pf.ckv + static_cast<size_t>(s0 + T - 1) * HD, HD * 4, cudaMemcpyDeviceToDevice, st), "pending");
+                ck(cudaMemcpyAsync(cst_sc[il], pf.csc + static_cast<size_t>(s0 + T - 1) * HD, HD * 4, cudaMemcpyDeviceToDevice, st), "pending");
+            }
+        }
+        if (n == 0) return;
+        norm_rows(pf.lat, n, HD, p + "attn_compressor_norm.weight");
+        if (c.owns_idx_key(il)) {
+            gemm(p + "indexer.attn_k.weight", pf.lat, n, pf.ik);
+            norm_rows(pf.ik, n, c.idx_dim, p + "indexer.k_norm.weight");
+            cuda::dsv41::rope_tail_rows(pf.ik, n, 1, c.idx_dim, rd, j0 * ratio, ratio, freq_comp, false, st);
+            ck(cudaMemcpyAsync(idx_keys[il] + static_cast<size_t>(j0) * c.idx_dim, pf.ik, static_cast<size_t>(n) * c.idx_dim * 4,
+                               cudaMemcpyDeviceToDevice, st), "idx k");
+        }
+        cuda::dsv41::rope_tail_rows(pf.lat, n, 1, HD, rd, j0 * ratio, ratio, freq_comp, false, st);
+        ck(cudaMemcpyAsync(comp_kv[il] + static_cast<size_t>(j0) * HD, pf.lat, static_cast<size_t>(n) * HD * 4, cudaMemcpyDeviceToDevice, st),
+           "comp kv");
+    }
+
+    void topk_chunk(int il, int pos0, int T) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        const int ratio = c.compress_ratio[il];
+        std::vector<int> nvis(T);
+        int nmax = 0;
+        for (int t = 0; t < T; ++t) { nvis[t] = (pos0 + t + 1) / ratio; nmax = std::max(nmax, nvis[t]); }
+        for (int t = 0; t < T; ++t) pf_nb[t] = std::min(c.idx_top_k, nvis[t]);
+        up(pf.nb, pf_nb);
+        if (nmax == 0) return;
+        up(pf.nvis, nvis);
+        gemm(p + "indexer.attn_q_b.weight", pf.qr, T, pf.iq);
+        cuda::dsv41::rope_tail_rows(pf.iq, T, c.idx_heads, c.idx_dim, c.rope_dims, pos0, 1, freq_comp, false, st);
+        gemm(p + "indexer.proj.weight", pf.x, T, pf.iw);
+        const float wscale = 1.f / std::sqrt(static_cast<float>(c.idx_dim) * c.idx_heads);
+        cuda::dsv41::indexer_score_rows(pf.iq, pf.iw, wscale, idx_keys[c.idx_key_source[il]], pf.nvis, nmax, c.idx_heads, c.idx_dim, T,
+                                        pf.isc, max_ctx, st);
+        for (int t = 0; t < T; ++t)
+            if (nvis[t] > 0) cuda::dsv41::topk_sorted(pf.isc + static_cast<size_t>(t) * max_ctx, nvis[t], pf_nb[t], pf.topk + t * c.idx_top_k, st);
+    }
+
+    void moe_chunk(int il, int T) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        const int D = c.n_embd, F = c.n_ff_exp, K = c.n_expert_used, A = T * K;
+        const float lim = static_cast<float>(c.swiglu_limit);
+        gemm(p + "ffn_gate_inp.weight", pf.x, T, pf.logit_e);
+        cuda::dsv41::router_topk_rows(pf.logit_e, V(p + "exp_probs_b.bias"), c.n_expert, K, static_cast<float>(c.expert_scale), T,
+                                      pf.ids, pf.w, st);
+        std::vector<int> hid(A);
+        std::vector<float> hw(A);
+        ck(cudaMemcpyAsync(hid.data(), pf.ids, A * 4, cudaMemcpyDeviceToHost, st), "ids");
+        ck(cudaMemcpyAsync(hw.data(), pf.w, A * 4, cudaMemcpyDeviceToHost, st), "w");
+        ck(cudaStreamSynchronize(st), "router");
+        // the assignments grouped by expert; each expert made resident once for the chunk
+        std::vector<int> order(A);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return hid[a] < hid[b]; });
+        std::vector<int> tok(A);
+        std::vector<float> wv(A);
+        std::vector<cuda::MoeItem> items;
+        const auto t0 = std::chrono::steady_clock::now();
+        const int tile = cuda::moe_tile();
+        for (int i = 0; i < A;) {
+            int j = i;
+            while (j < A && hid[order[j]] == hid[order[i]]) ++j;
+            const uint8_t * base = expert_slot(il, hid[order[i]]);
+            for (int a0 = i; a0 < j; a0 += tile) items.push_back({base, a0, std::min(tile, j - a0)});
+            i = j;
+        }
+        for (int a = 0; a < A; ++a) { tok[a] = order[a] / K; wv[a] = hw[order[a]]; }
+        t_expert_copy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        up(pf.tok, tok);
+        up(pf.wa, wv);
+        up(pf.items, items);
+        ck(cudaMemsetAsync(pf.moe, 0, static_cast<size_t>(T) * D * 4, st), "moe");
+        cuda::quantize_q8(pf.x, D, pf.xq, st, T);
+        cuda::moe_gather(pf.xq, pf.tok, A, D, pf.xg, st);
+        cuda::moe_gate_up(expert_type, pf.items, static_cast<int>(items.size()), gu_expert_bytes, F, D, pf.xg, pf.act, st, lim);
+        cuda::quantize_q8(pf.act, F, pf.actq, st, A);
+        cuda::moe_down(expert_type, pf.items, static_cast<int>(items.size()), gu_expert_bytes, d_row_bytes, F, D, pf.actq, pf.tok,
+                       pf.wa, pf.moe, st);
+        // the shared expert
+        gemm(p + "ffn_gate_shexp.weight", pf.x, T, pf.g);
+        gemm(p + "ffn_up_shexp.weight", pf.x, T, pf.u);
+        cuda::dsv41::swiglu_clamp(pf.g, pf.u, pf.a, T * F, lim, st);
+        gemm(p + "ffn_down_shexp.weight", pf.a, T, pf.sh);
+        ck(cudaMemcpyAsync(pf.ffo, pf.moe, static_cast<size_t>(T) * D * 4, cudaMemcpyDeviceToDevice, st), "ffn");
+        cuda::add(pf.ffo, pf.sh, T * D, st);
+        ck(cudaStreamSynchronize(st), "moe");   // the host vectors above go out of scope
+    }
+
+    // the prompt in chunks; returns the last position's logits (all positions' in all_out when given)
+    const std::vector<float> & prefill(const std::vector<int> & prompt, std::vector<float> * all_out) {
+        if (prompt.empty()) return logits;
+        if (static_cast<int>(toks.size() + prompt.size()) > max_ctx) throw std::runtime_error("context full");
+        const auto t0 = std::chrono::steady_clock::now();
+        const int pos_start = static_cast<int>(toks.size());
+        for (int t : prompt) {
+            if (t < 0 || t >= c.n_vocab) throw std::runtime_error("token id out of range");
+            toks.push_back(t);
+        }
+        const int n = static_cast<int>(prompt.size());
+        if (all_out) {
+            ck(cudaMalloc(reinterpret_cast<void **>(&pf.logits), static_cast<size_t>(n) * c.n_vocab * 4), "logits");
+            pf_logits_from = pos_start;
+        }
+        for (int i = 0; i < n; i += kChunk) prefill_chunk(pos_start + i, std::min(kChunk, n - i), all_out != nullptr);
+        if (all_out) {
+            all_out->resize(static_cast<size_t>(n) * c.n_vocab);
+            ck(cudaMemcpy(all_out->data(), pf.logits, all_out->size() * 4, cudaMemcpyDeviceToHost), "logits");
+            cudaFree(pf.logits);
+            pf.logits = nullptr;
+            std::copy(all_out->end() - c.n_vocab, all_out->end(), logits.begin());
+        } else {
+            ck(cudaMemcpy(logits.data(), logits_d, c.n_vocab * 4, cudaMemcpyDeviceToHost), "logits");
+        }
+        t_prefill += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        n_prefill += n;
+        return logits;
+    }
+    double t_prefill = 0;
+    long n_prefill = 0;
+
     const std::vector<float> & step(int token) {
         if (static_cast<int>(toks.size()) >= max_ctx) throw std::runtime_error("context full");
         if (token < 0 || token >= c.n_vocab) throw std::runtime_error("token id out of range");
@@ -710,19 +1062,22 @@ const Dsv41Config & Dsv41Engine::config() const { return p_->c; }
 void Dsv41Engine::reset() { p_->reset(); }
 int Dsv41Engine::position() const { return static_cast<int>(p_->toks.size()); }
 const std::vector<float> & Dsv41Engine::step(int token) { return p_->step(token); }
+const std::vector<float> & Dsv41Engine::prefill(const std::vector<int> & t, std::vector<float> * all) { return p_->prefill(t, all); }
 void Dsv41Engine::set_probe(Probe p) { p_->probe = std::move(p); }
 
 std::string Dsv41Engine::report() const {
     std::ostringstream os;
     const auto & q = *p_;
-    if (q.n_steps == 0) return "no steps";
-    os << q.n_steps << " steps, " << 1000.0 * q.t_total / q.n_steps << " ms/token (expert copies "
-       << 1000.0 * q.t_expert_copy / q.n_steps << " ms, Engram rows " << 1000.0 * q.t_engram / q.n_steps << " ms); "
+    if (q.n_steps == 0 && q.n_prefill == 0) return "no steps";
+    if (q.n_prefill) os << "prefill " << q.n_prefill << " tokens in " << q.t_prefill << " s (" << q.n_prefill / q.t_prefill << " tok/s); ";
+    const int ns = std::max(q.n_steps, 1);
+    os << q.n_steps << " steps, " << 1000.0 * q.t_total / ns << " ms/token (expert copies, prefill included: "
+       << 1000.0 * q.t_expert_copy / ns << " ms, Engram rows " << 1000.0 * q.t_engram / ns << " ms); "
        << "expert cache hit rate " << (q.hits + q.misses ? 100.0 * q.hits / (q.hits + q.misses) : 0.0) << "% of "
        << q.hits + q.misses;
     if (q.hybrid)
-        os << "; CPU experts " << static_cast<double>(q.cpu_experts) / q.n_steps << "/token in " << 1000.0 * q.t_cpu / q.n_steps
-           << " ms, then GPU wait " << 1000.0 * q.t_gpu_wait / q.n_steps << " ms";
+        os << "; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
+           << " ms, then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms";
     return os.str();
 }
 

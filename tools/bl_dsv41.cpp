@@ -3,6 +3,8 @@
 //   bl-dsv41 --model SHARD1.gguf (--tokens 1,2,3 | --tokens-file F) [--gen N] [--ctx N]
 //            [--save-logits FILE] [--dump DIR [--filter REGEX]]
 //   bl-dsv41 --model SHARD1.gguf --tokens-file F --engram-rows     (the Engram row ids per position, no weights)
+//   bl-dsv41 ... --prefill          the prompt through the chunked prefill (then --gen steps)
+//   bl-dsv41 ... --check-prefill    prefill's logits at every position against one step per token: KL, top-1
 //
 // Feeds the tokens one step each, prints the top-5 after each and then greedy-generates N more. --save-logits
 // writes every fed position's logits (T rows of n_vocab float32: tools/logits_compare.py against bl-ref-dump).
@@ -11,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <numeric>
@@ -46,7 +49,7 @@ void usage() {
 int main(int argc, char ** argv) {
     std::string model, tokens_s, tokens_file, save_logits, dump_dir, filter = ".*";
     int gen = 0, ctx = 4096;
-    bool engram_rows = false;
+    bool engram_rows = false, use_prefill = false, check_prefill = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -62,6 +65,8 @@ int main(int argc, char ** argv) {
         else if (a == "--dump") dump_dir = next();
         else if (a == "--filter") filter = next();
         else if (a == "--engram-rows") engram_rows = true;
+        else if (a == "--prefill") use_prefill = true;          // the prompt through prefill(), then --gen steps
+        else if (a == "--check-prefill") check_prefill = true;  // prefill's logits against stepping each token
         else { usage(); return 2; }
     }
     if (model.empty() || (tokens_s.empty() && tokens_file.empty())) { usage(); return 2; }
@@ -127,7 +132,49 @@ int main(int argc, char ** argv) {
             return id;
         };
         int last = -1;
-        for (size_t i = 0; i < prompt.size(); ++i) {
+        auto log_softmax = [&](const float * l, std::vector<double> & out) {
+            out.resize(V);
+            double mx = -1e300, z = 0;
+            for (int i = 0; i < V; ++i) mx = std::max(mx, static_cast<double>(l[i]));
+            for (int i = 0; i < V; ++i) z += std::exp(l[i] - mx);
+            for (int i = 0; i < V; ++i) out[i] = l[i] - mx - std::log(z);
+        };
+        if (check_prefill) {
+            std::vector<float> all;
+            const auto a = std::chrono::steady_clock::now();
+            eng.prefill(prompt, &all);
+            const auto b = std::chrono::steady_clock::now();
+            std::printf("prefill %zu tokens: %.2f s\n", prompt.size(), std::chrono::duration<double>(b - a).count());
+            eng.reset();
+            double kl_sum = 0, kl_max = 0;
+            int agree = 0;
+            std::vector<double> lp, ls;
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                const auto & l = eng.step(prompt[i]);
+                log_softmax(all.data() + i * V, lp);
+                log_softmax(l.data(), ls);
+                double kl = 0;
+                for (int j = 0; j < V; ++j) kl += std::exp(ls[j]) * (ls[j] - lp[j]);
+                kl_sum += kl;
+                kl_max = std::max(kl_max, kl);
+                agree += top(l, 1)[0] == top(std::vector<float>(all.begin() + i * V, all.begin() + (i + 1) * V), 1)[0];
+            }
+            std::printf("prefill vs steps over %zu positions: mean KL %.5f, max %.5f, top-1 agreement %d/%zu\n", prompt.size(),
+                        kl_sum / prompt.size(), kl_max, agree, prompt.size());
+            std::printf("%s\n", eng.report().c_str());
+            return 0;
+        }
+        if (use_prefill) {
+            std::vector<float> all;
+            const auto & l = eng.prefill(prompt, lg ? &all : nullptr);
+            if (lg) lg.write(reinterpret_cast<const char *>(all.data()), all.size() * 4);
+            const auto t = top(l, 5);
+            std::printf("prefill %zu tokens -> top5", prompt.size());
+            for (int id : t) std::printf(" %d(%.2f)", id, l[id]);
+            std::printf("\n");
+            last = t[0];
+        }
+        for (size_t i = 0; i < (use_prefill ? 0 : prompt.size()); ++i) {
             const auto & l = eng.step(prompt[i]);
             if (lg) lg.write(reinterpret_cast<const char *>(l.data()), V * 4);
             const auto t = top(l, 5);
