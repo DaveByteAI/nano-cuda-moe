@@ -1,6 +1,7 @@
 #include "bl/dsv41_ops.h"
 
 #include <cfloat>
+#include <cstdint>
 
 namespace bl::cuda::dsv41 {
 
@@ -233,6 +234,78 @@ __global__ void router_topk_k(const float * logits, const float * bias, int n, i
     if (i < k) w[i] = w[i] / (wsum + 1e-20f) * scale;
 }
 
+// order-preserving float -> uint32 (larger float, larger key)
+__device__ uint32_t fkey(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// one block of 1024 threads; thread i owns the contiguous chunk [i * per, (i+1) * per)
+__global__ void topk_sorted_k(const float * score, int n, int k, int * out) {
+    __shared__ uint32_t sT;
+    __shared__ int cnt;
+    __shared__ int scan[1024];
+    const int tid = threadIdx.x, nt = blockDim.x, per = (n + nt - 1) / nt;
+    const int b0 = min(n, tid * per), b1 = min(n, b0 + per);
+    if (tid == 0) sT = 0;
+    __syncthreads();
+    // the k-th largest key: the largest T with #(key >= T) >= k, one bit at a time from the top
+    for (int bit = 31; bit >= 0; --bit) {
+        const uint32_t t = sT | (1u << bit);
+        int c = 0;
+        for (int i = b0; i < b1; ++i) c += fkey(score[i]) >= t;
+        if (tid == 0) cnt = 0;
+        __syncthreads();
+        atomicAdd(&cnt, c);
+        __syncthreads();
+        if (tid == 0 && cnt >= k) sT = t;
+        __syncthreads();
+    }
+    const uint32_t T = sT;
+    int gt = 0;
+    for (int i = b0; i < b1; ++i) gt += fkey(score[i]) > T;
+    if (tid == 0) cnt = 0;
+    __syncthreads();
+    atomicAdd(&cnt, gt);
+    __syncthreads();
+    const int need_eq = k - cnt;   // equal keys to take, lowest indices first
+    // ordered scan: equal keys before mine, then the takes before mine
+    int eq = 0;
+    for (int i = b0; i < b1; ++i) eq += fkey(score[i]) == T;
+    scan[tid] = eq;
+    __syncthreads();
+    for (int o = 1; o < nt; o <<= 1) {   // inclusive Hillis-Steele scan
+        const int v = tid >= o ? scan[tid - o] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    int eq_before = scan[tid] - eq;
+    __syncthreads();
+    int take = 0;
+    {
+        int e = eq_before;
+        for (int i = b0; i < b1; ++i) {
+            const uint32_t kk = fkey(score[i]);
+            if (kk > T) ++take;
+            else if (kk == T && e++ < need_eq) ++take;
+        }
+    }
+    scan[tid] = take;
+    __syncthreads();
+    for (int o = 1; o < nt; o <<= 1) {
+        const int v = tid >= o ? scan[tid - o] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    int w = scan[tid] - take, e = eq_before;
+    for (int i = b0; i < b1; ++i) {
+        const uint32_t kk = fkey(score[i]);
+        if (kk > T || (kk == T && e++ < need_eq)) out[w++] = i;
+    }
+}
+
 __global__ void swiglu_clamp_k(const float * g, const float * u, float * out, int n, float limit) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -282,6 +355,11 @@ void indexer_score(const float * q, const float * w, float wscale, const float *
 
 void router_topk(const float * logits, const float * bias, int n, int k, float scale, int * ids, float * w, cudaStream_t s) {
     router_topk_k<<<1, 32 * ((n + 31) / 32), 0, s>>>(logits, bias, n, k, scale, ids, w);
+}
+
+void topk_sorted(const float * score, int n, int k, int * out, cudaStream_t s) {
+    if (n <= 0 || k <= 0) return;
+    topk_sorted_k<<<1, 1024, 0, s>>>(score, n, k < n ? k : n, out);
 }
 
 void swiglu_clamp(const float * g, const float * u, float * out, int n, float limit, cudaStream_t s) {

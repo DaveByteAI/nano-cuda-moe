@@ -480,18 +480,9 @@ struct Dsv41Engine::Impl {
         const float wscale = 1.f / std::sqrt(static_cast<float>(c.idx_dim) * c.idx_heads);
         cuda::dsv41::indexer_score(iq, iw, wscale, idx_keys[c.idx_key_source[il]], n_vis, c.idx_heads, c.idx_dim, isc, st);
         P("idx_score", il, isc, n_vis);
-        std::vector<float> sc(n_vis);
-        ck(cudaMemcpyAsync(sc.data(), isc, n_vis * 4, cudaMemcpyDeviceToHost, st), "scores");
-        ck(cudaStreamSynchronize(st), "scores");
+        // on the GPU, in position order like the reference's re-sort; how many is known here, so no sync
         const int k = std::min(c.idx_top_k, n_vis);
-        std::vector<int> idx(n_vis);
-        std::iota(idx.begin(), idx.end(), 0);
-        if (k < n_vis)
-            std::nth_element(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return sc[a] > sc[b] || (sc[a] == sc[b] && a < b); });
-        idx.resize(k);
-        std::sort(idx.begin(), idx.end());   // position order, as the reference re-sorts
-        ck(cudaMemcpyAsync(topk_idx, idx.data(), k * 4, cudaMemcpyHostToDevice, st), "topk");
-        ck(cudaStreamSynchronize(st), "topk");
+        cuda::dsv41::topk_sorted(isc, n_vis, k, topk_idx, st);
         n_topk = k;
     }
 

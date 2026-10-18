@@ -225,6 +225,28 @@ int main() {
         check("router ids", gid, want_id, 0.f);
         check("router weights", host(dw, k), want_w, 1e-5f);
     }
+    {   // topk_sorted against nth_element + sort (ties: lower index first), with many ties and n below / above k
+        for (int n : {300, 512, 4000, 16384}) {
+            Vec sc(n);
+            std::uniform_int_distribution<int> q(0, 200);
+            for (auto & v : sc) v = static_cast<float>(q(rng)) * 0.25f - 20.f;   // coarse: lots of equal scores
+            const int k = std::min(512, n);
+            std::vector<int> id(n);
+            std::iota(id.begin(), id.end(), 0);
+            std::nth_element(id.begin(), id.begin() + k - 1, id.end(), [&](int a, int b) { return sc[a] > sc[b] || (sc[a] == sc[b] && a < b); });
+            id.resize(k);
+            std::sort(id.begin(), id.end());
+            float * ds = dev(sc);
+            int * dout = dev(std::vector<int>(k));
+            topk_sorted(ds, n, 512, dout, 0);
+            const auto got = host(dout, k);
+            Vec g(k), w(k);
+            for (int i = 0; i < k; ++i) { g[i] = static_cast<float>(got[i]); w[i] = static_cast<float>(id[i]); }
+            char name[32];
+            std::snprintf(name, sizeof name, "topk n=%d", n);
+            check(name, g, w, 0.f);
+        }
+    }
     {   // swiglu_clamp
         const int n = 2304;
         Vec g = rnd(n, 8.f), u = rnd(n, 8.f), want(n);

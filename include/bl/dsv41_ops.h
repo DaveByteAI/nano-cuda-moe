@@ -35,6 +35,10 @@ void pool2(const float * kv, const float * score, float * out, int D, cudaStream
 void indexer_score(const float * q, const float * w, float wscale, const float * keys, int N, int H, int Di, float * out,
                    cudaStream_t s);
 
+// the k = min(k, n) largest of score[0..n) as indices in increasing order (ties: the lower index first), one block
+// (radix select on the float bits, then an ordered scan): the indexer's top-k without a trip to the host
+void topk_sorted(const float * score, int n, int k, int * out, cudaStream_t s);
+
 // Gate (sqrtsoftplus, noaux_tc): s = sqrt(softplus(logit)); the top k by s + bias; w = s / sum(s) * scale
 void router_topk(const float * logits, const float * bias, int n, int k, float scale, int * ids, float * w, cudaStream_t s);
 
