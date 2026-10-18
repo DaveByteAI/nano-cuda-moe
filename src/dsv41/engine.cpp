@@ -16,8 +16,12 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <cuda_runtime.h>
 
+#include "bl/cpu_experts.h"
 #include "bl/cuda_ops.h"
 #include "bl/cuda_pipeline.h"
 #include "bl/cuda_quant.h"
@@ -110,6 +114,15 @@ struct Dsv41Engine::Impl {
     // BL_DSV41_DP4A=1: the experts through the decode pipeline's dp4a kernels (q8_1 activations, 2.6x faster);
     // default the fp32 matvec, exact against a double reference (for the comparisons with llama.cpp)
     bool dp4a = std::getenv("BL_DSV41_DP4A") && std::atoi(std::getenv("BL_DSV41_DP4A")) != 0;
+    // BL_DSV41_HYBRID=1: VRAM hits on the GPU (dp4a) while the CPU computes the misses in place in the mapped file
+    // (the page cache is the RAM tier, the disk behind it the third); BL_DSV41_ADMIT misses per layer and token are
+    // then copied into the VRAM cache (default 1)
+    bool hybrid = std::getenv("BL_DSV41_HYBRID") && std::atoi(std::getenv("BL_DSV41_HYBRID")) != 0;
+    int admit = std::getenv("BL_DSV41_ADMIT") ? std::atoi(std::getenv("BL_DSV41_ADMIT")) : 1;
+    std::unique_ptr<CpuExperts> cpu;
+    float * x_h = nullptr, * cpu_out_h = nullptr, * cpu_out_d = nullptr;
+    double t_cpu = 0, t_gpu_wait = 0;
+    uint64_t cpu_experts = 0;
     cuda::ExpertPlan * plan_h = nullptr, * plan_d = nullptr;
     void * xq = nullptr;
     float * pact = nullptr, * pout = nullptr;
@@ -296,6 +309,14 @@ struct Dsv41Engine::Impl {
         }
         ck(cudaDeviceSynchronize(), "load");
 
+        if (hybrid) {
+            dp4a = true;
+            const int nt = std::getenv("BL_CPU_THREADS") ? std::atoi(std::getenv("BL_CPU_THREADS")) : 8;
+            cpu = std::make_unique<CpuExperts>(nt);
+            ck(cudaMallocHost(&x_h, sizeof(float) * D), "pinned");
+            ck(cudaMallocHost(&cpu_out_h, sizeof(float) * c.n_expert_used * D), "pinned");
+            cpu_out_d = dalloc<float>(static_cast<size_t>(c.n_expert_used) * D);
+        }
         if (dp4a) {
             ck(cudaMallocHost(&plan_h, sizeof(cuda::ExpertPlan)), "pinned");
             plan_d = dalloc<cuda::ExpertPlan>(1);
@@ -348,6 +369,8 @@ struct Dsv41Engine::Impl {
         for (void * p : allocs) cudaFree(p);
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
+        if (x_h) cudaFreeHost(x_h);
+        if (cpu_out_h) cudaFreeHost(cpu_out_h);
         if (st) cudaStreamDestroy(st);
     }
 
@@ -484,6 +507,11 @@ struct Dsv41Engine::Impl {
         ck(cudaMemcpyAsync(hw.data(), wsel, K * 4, cudaMemcpyDeviceToHost, st), "w");
         ck(cudaStreamSynchronize(st), "router");
 
+        if (hybrid) {
+            moe_hybrid(il, hid, hw);
+            shared_and_out(il);
+            return;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<const uint8_t *> base_k(K);
         for (int k = 0; k < K; ++k) base_k[k] = expert_slot(il, hid[k]);
@@ -512,6 +540,13 @@ struct Dsv41Engine::Impl {
             cuda::matvec(expert_type, base + 2 * gu_expert_bytes, d_row_bytes, D, F, abuf, ebuf, st);
             cuda::axpy(moe, ebuf, hw[k], D, st);
         }
+        shared_and_out(il);
+    }
+
+    void shared_and_out(int il) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        const int D = c.n_embd, F = c.n_ff_exp;
+        const float lim = static_cast<float>(c.swiglu_limit);
         P("ffn_moe_out", il, moe, D);
         mv(p + "ffn_gate_shexp.weight", x, gbuf);
         mv(p + "ffn_up_shexp.weight", x, ubuf);
@@ -521,6 +556,73 @@ struct Dsv41Engine::Impl {
         ck(cudaMemcpyAsync(ffo, moe, D * 4, cudaMemcpyDeviceToDevice, st), "ffn");
         cuda::add(ffo, shx, D, st);
         P("ffn_out", il, ffo, D);
+    }
+
+    // hits on the GPU, misses on the CPU at the same time; then a few misses admitted into the VRAM cache
+    void moe_hybrid(int il, const std::vector<int> & hid, const std::vector<float> & hw) {
+        const int D = c.n_embd, F = c.n_ff_exp, K = c.n_expert_used;
+        const float lim = static_cast<float>(c.swiglu_limit);
+        std::vector<int> gk, ck_;   // indices k of the hits / the misses
+        std::vector<const uint8_t *> gbase;
+        for (int k = 0; k < K; ++k) {
+            auto it = where.find(il * c.n_expert + hid[k]);
+            if (it != where.end()) {
+                ++hits;
+                lru.splice(lru.begin(), lru, it->second);
+                gk.push_back(k);
+                gbase.push_back(xslots + static_cast<size_t>(*it->second) * (2 * gu_expert_bytes + d_expert_bytes));
+            } else {
+                ++misses;
+                ck_.push_back(k);
+            }
+        }
+        ck(cudaMemsetAsync(moe, 0, D * 4, st), "moe");
+        if (!gk.empty()) {   // the GPU part is queued first and runs while the CPU works
+            std::memset(plan_h, 0, sizeof *plan_h);
+            const int n = static_cast<int>(gk.size());
+            plan_h->T = 1; plan_h->K = n; plan_h->n_slots = n;
+            for (int i = 0; i < n; ++i) {
+                plan_h->ids[i] = hid[gk[i]]; plan_h->kind[i] = cuda::kHit; plan_h->mask[i] = 1; plan_h->base[i] = gbase[i];
+                plan_h->sel[0][i] = i; plan_h->w[0][i] = hw[gk[i]];
+            }
+            ck(cudaMemcpyAsync(plan_d, plan_h, sizeof *plan_h, cudaMemcpyHostToDevice, st), "plan");
+            cuda::quantize_q8(x, D, xq, st);
+            cuda::plan_gate_up(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, xq, pact, st, lim);
+            cuda::plan_down(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, pact, pout, st);
+            for (int i = 0; i < n; ++i) cuda::axpy(moe, pout + static_cast<size_t>(i) * cuda::kMaxT * D, hw[gk[i]], D, st);
+        }
+        if (!ck_.empty()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            // x was final before the router's sync; a pinned copy is a few microseconds
+            ck(cudaMemcpy(x_h, x, D * 4, cudaMemcpyDeviceToHost), "x");
+            const int n = static_cast<int>(ck_.size());
+            std::vector<CpuExperts::Job> jobs(n);
+            const long pg = sysconf(_SC_PAGESIZE);
+            auto willneed = [&](const uint8_t * a, size_t len) {   // start the disk reads of all misses at once
+                const uintptr_t b = reinterpret_cast<uintptr_t>(a) & ~static_cast<uintptr_t>(pg - 1);
+                madvise(reinterpret_cast<void *>(b), len + (reinterpret_cast<uintptr_t>(a) - b), MADV_WILLNEED);
+            };
+            for (int j = 0; j < n; ++j) {
+                const size_t e = static_cast<size_t>(hid[ck_[j]]);
+                const uint8_t * gp = experts[il].gate + e * gu_expert_bytes, * up = experts[il].up + e * gu_expert_bytes,
+                              * dp = experts[il].down + e * d_expert_bytes;
+                willneed(gp, gu_expert_bytes); willneed(up, gu_expert_bytes); willneed(dp, d_expert_bytes);
+                jobs[j] = {gp, 1, cpu_out_h + static_cast<size_t>(j) * D, up, dp};
+            }
+            cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), n, lim);
+            cpu_experts += n;
+            t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            ck(cudaMemcpyAsync(cpu_out_d, cpu_out_h, sizeof(float) * n * D, cudaMemcpyHostToDevice, st), "cpu out");
+            for (int j = 0; j < n; ++j) cuda::axpy(moe, cpu_out_d + static_cast<size_t>(j) * D, hw[ck_[j]], D, st);
+            // admit a few: their pages are hot now, so the copies come from RAM
+            for (int j = 0; j < std::min(n, admit); ++j) {
+                expert_slot(il, hid[ck_[j]]);
+                --misses;   // expert_slot counted a miss for what was already counted above
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        ck(cudaStreamSynchronize(st), "moe");   // cpu_out_h is rewritten by the next layer
+        t_gpu_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     }
 
     const std::vector<float> & step(int token) {
@@ -615,6 +717,9 @@ std::string Dsv41Engine::report() const {
        << 1000.0 * q.t_expert_copy / q.n_steps << " ms, Engram rows " << 1000.0 * q.t_engram / q.n_steps << " ms); "
        << "expert cache hit rate " << (q.hits + q.misses ? 100.0 * q.hits / (q.hits + q.misses) : 0.0) << "% of "
        << q.hits + q.misses;
+    if (q.hybrid)
+        os << "; CPU experts " << static_cast<double>(q.cpu_experts) / q.n_steps << "/token in " << 1000.0 * q.t_cpu / q.n_steps
+           << " ms, then GPU wait " << 1000.0 * q.t_gpu_wait / q.n_steps << " ms";
     return os.str();
 }
 

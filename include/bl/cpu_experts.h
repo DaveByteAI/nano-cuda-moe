@@ -19,6 +19,8 @@ public:
         const uint8_t * base;   // the expert's [gate | up | down] in host memory
         int             mask;   // bit t: token t of the window uses it
         float *         out;    // [T][D]: rows of the tokens in mask are written
+        const uint8_t * up = nullptr;     // set: up and down live elsewhere (base is then gate alone), e.g. the
+        const uint8_t * down = nullptr;   // separate expert tensors of a mapped GGUF
     };
     // out[t] = down(silu(gate . x[t]) * (up . x[t])) for each job and each token in its mask; x is [T][D];
     // blocks until all are done. swiglu_limit > 0 clamps first: gate . x at most the limit, up . x within +-limit

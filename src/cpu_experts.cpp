@@ -142,7 +142,7 @@ struct CpuExperts::Impl {
     // rows r0.. of job e's gate and up, for every token in its mask (the rows stay in cache across the tokens)
     static void gate_up_task(Impl * I, int task) {
         const int per = I->F / kGuRows, e = task / per, r0 = (task % per) * kGuRows;
-        const uint8_t * g = I->jobs[e].base, * u = g + I->gu_bytes;
+        const uint8_t * g = I->jobs[e].base, * u = I->jobs[e].up ? I->jobs[e].up : g + I->gu_bytes;
         const int mask = I->jobs[e].mask;
         if (I->iq_gu && __builtin_popcount(static_cast<unsigned>(mask)) >= 2) {   // each row decoded once for all the job's tokens
             // (one token: ggml's vec_dot below is as fast or faster)
@@ -178,7 +178,7 @@ struct CpuExperts::Impl {
     }
     static void down_task(Impl * I, int task) {
         const int per = I->D / kDownRows, e = task / per, r0 = (task % per) * kDownRows;
-        const uint8_t * d = I->jobs[e].base + 2 * I->gu_bytes;
+        const uint8_t * d = I->jobs[e].down ? I->jobs[e].down : I->jobs[e].base + 2 * I->gu_bytes;
         const int mask = I->jobs[e].mask;
         for (int t = 0; t < I->T; ++t) {
             if (!((mask >> t) & 1)) continue;
