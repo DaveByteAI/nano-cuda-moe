@@ -45,4 +45,31 @@ void router_topk(const float * logits, const float * bias, int n, int k, float s
 // Expert: out = silu(min(g, limit)) * clamp(u, -limit, limit)
 void swiglu_clamp(const float * g, const float * u, float * out, int n, float limit, cudaStream_t s);
 
+// ---- the same over T tokens at once (prefill). Row t of every [T][...] array is token t.
+
+// positions pos0 + t * step (step: 1 for tokens, the compress ratio for compressed latents)
+void rope_tail_rows(float * x, int T, int heads, int D, int n_rot, int pos0, int step, const float * freq, bool inverse,
+                    cudaStream_t s);
+// m [T][(2+hc)*hc], R [T][hc][D] -> pre [T][hc], post [T][hc], comb [T][hc][hc]
+void hc_split_rows(const float * m, const float * R, const float * scale, const float * base, int hc, int D, int T,
+                   float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb, cudaStream_t s);
+void hc_pre_rows(const float * R, const float * pre, float * out, int hc, int D, int T, cudaStream_t s);
+void hc_post_rows(const float * h, const float * res, const float * post, const float * comb, float * out, int hc, int D,
+                  int T, cudaStream_t s);
+// kv [T][(hc+1)*D]
+void engram_gate_rows(float * R, const float * kv, const float * qk, int hc, int D, int T, float eps, cudaStream_t s);
+// logits [T][n] -> ids [T][k], w [T][k]
+void router_topk_rows(const float * logits, const float * bias, int n, int k, float scale, int T, int * ids, float * w,
+                      cudaStream_t s);
+// out[t][j] for j < n_vis[t] (device array), row stride ld; q [T][H][Di], w [T][H]
+void indexer_score_rows(const float * q, const float * w, float wscale, const float * keys, const int * n_vis, int n_max,
+                        int H, int Di, int T, float * out, int ld, cudaStream_t s);
+// query t: the contiguous rows [a0[t], a0[t] + na[t]) of A, and rows idx_b[t][0..nb[t]) of B (idx_b row stride ldb);
+// n_max = the largest na + nb (shared memory); q, out [T][H][D]
+void attention_sink_rows(const float * q, const float * A, const int * a0, const int * na, const float * B, const int * idx_b,
+                         int ldb, const int * nb, int n_max, const float * sink, float * out, int H, int D, int T, float scale,
+                         cudaStream_t s);
+// n groups of 2 consecutive rows: out[g] = pool of rows 2g, 2g+1 of kv/score ([2n][D])
+void pool2_rows(const float * kv, const float * score, float * out, int D, int n, cudaStream_t s);
+
 }  // namespace bl::cuda::dsv41

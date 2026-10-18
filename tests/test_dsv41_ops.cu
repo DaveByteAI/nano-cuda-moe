@@ -247,6 +247,89 @@ int main() {
             check(name, g, w, 0.f);
         }
     }
+    {   // the batched (prefill) kernels against the one-token kernels, row by row (T = 5)
+        const int T = 5, hc = 4, E = 5120, mixn = (2 + hc) * hc;
+        Vec R = rnd(T * hc * E), m = rnd(T * mixn, 30.f), scale = {0.5f, 0.7f, 0.9f}, base = rnd(mixn);
+        float * dR = dev(R), * dm = dev(m), * ds = dev(scale), * db = dev(base);
+        float * pre = dev(Vec(T * hc)), * post = dev(Vec(T * hc)), * comb = dev(Vec(T * hc * hc));
+        hc_split_rows(dm, dR, ds, db, hc, E, T, 1e-20f, 1e-6f, 20, pre, post, comb, 0);
+        Vec bp = host(pre, T * hc), bq = host(post, T * hc), bc = host(comb, T * hc * hc), sp, sq, sc2;
+        for (int t = 0; t < T; ++t) {
+            float * p1 = dev(Vec(hc)), * q1 = dev(Vec(hc)), * c1 = dev(Vec(hc * hc));
+            hc_split(dm + t * mixn, dR + static_cast<size_t>(t) * hc * E, ds, db, hc, E, 1e-20f, 1e-6f, 20, p1, q1, c1, 0);
+            for (float v : host(p1, hc)) sp.push_back(v);
+            for (float v : host(q1, hc)) sq.push_back(v);
+            for (float v : host(c1, hc * hc)) sc2.push_back(v);
+        }
+        check("rows hc_split", Vec(bp.begin(), bp.end()), sp, 0.f);
+        check("rows hc_split c", bc, sc2, 0.f);
+
+        Vec h = rnd(T * E);
+        float * dh = dev(h), * o1 = dev(Vec(T * E)), * o2 = dev(Vec(T * hc * E));
+        hc_pre_rows(dR, pre, o1, hc, E, T, 0);
+        hc_post_rows(dh, dR, post, comb, o2, hc, E, T, 0);
+        Vec bpre = host(o1, T * E), bpost = host(o2, T * hc * E), spre, spost;
+        for (int t = 0; t < T; ++t) {
+            float * a = dev(Vec(E)), * b = dev(Vec(hc * E));
+            hc_pre(dR + static_cast<size_t>(t) * hc * E, pre + t * hc, a, hc, E, 0);
+            hc_post(dh + static_cast<size_t>(t) * E, dR + static_cast<size_t>(t) * hc * E, post + t * hc, comb + t * hc * hc, b, hc, E, 0);
+            for (float v : host(a, E)) spre.push_back(v);
+            for (float v : host(b, hc * E)) spost.push_back(v);
+        }
+        check("rows hc_pre", bpre, spre, 0.f);
+        check("rows hc_post", bpost, spost, 0.f);
+
+        Vec kv = rnd(T * (hc + 1) * E), qk = rnd(hc * E, 0.3f);
+        float * dkv = dev(kv), * dqk = dev(qk), * Rb = dev(R), * Rs = dev(R);
+        engram_gate_rows(Rb, dkv, dqk, hc, E, T, 1e-20f, 0);
+        for (int t = 0; t < T; ++t) engram_gate(Rs + static_cast<size_t>(t) * hc * E, dkv + static_cast<size_t>(t) * (hc + 1) * E, dqk, hc, E, 1e-20f, 0);
+        check("rows engram", host(Rb, T * hc * E), host(Rs, T * hc * E), 0.f);
+
+        const int n = 384, k = 6;
+        Vec l = rnd(T * n, 3.f), bias = rnd(n, 0.1f);
+        float * dl = dev(l), * dbias = dev(bias), * w1 = dev(Vec(T * k));
+        int * i1 = dev(std::vector<int>(T * k));
+        router_topk_rows(dl, dbias, n, k, 1.5f, T, i1, w1, 0);
+        Vec bw = host(w1, T * k), sw;
+        std::vector<int> bi = host(i1, T * k), si;
+        for (int t = 0; t < T; ++t) {
+            float * w2 = dev(Vec(k));
+            int * i2 = dev(std::vector<int>(k));
+            router_topk(dl + t * n, dbias, n, k, 1.5f, i2, w2, 0);
+            for (float v : host(w2, k)) sw.push_back(v);
+            for (int v : host(i2, k)) si.push_back(v);
+        }
+        check("rows router w", bw, sw, 0.f);
+        Vec fbi(bi.begin(), bi.end()), fsi(si.begin(), si.end());
+        check("rows router ids", fbi, fsi, 0.f);
+
+        Vec x = rnd(T * 64 * 512), f(32);
+        for (int i = 0; i < 32; ++i) f[i] = 1.f / std::pow(160000.f, 2.f * i / 64);
+        float * dx = dev(x), * dxs = dev(x), * df = dev(f);
+        rope_tail_rows(dx, T, 64, 512, 64, 100, 2, df, false, 0);
+        for (int t = 0; t < T; ++t) rope_tail(dxs + static_cast<size_t>(t) * 64 * 512, 64, 512, 64, 100 + 2 * t, df, false, 0);
+        check("rows rope", host(dx, x.size()), host(dxs, x.size()), 0.f);
+
+        // attention over a window range of A and picked rows of B, against the one-token kernel
+        const int H = 64, D = 512, nA = 300, nB = 1000;
+        Vec q = rnd(T * H * D, 0.2f), A = rnd(nA * D), B = rnd(nB * D), sink = rnd(H);
+        std::vector<int> a0 = {0, 10, 50, 100, 172}, na = {1, 40, 128, 128, 128}, nb = {0, 3, 17, 64, 200}, ib(T * 512);
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < 512; ++j) ib[t * 512 + j] = (j * 13 + t) % nB;
+        float * dq = dev(q), * dA = dev(A), * dB = dev(B), * dsk = dev(sink), * dout = dev(Vec(T * H * D));
+        int * da0 = dev(a0), * dna = dev(na), * dnb = dev(nb), * dib = dev(ib);
+        attention_sink_rows(dq, dA, da0, dna, dB, dib, 512, dnb, 128 + 200, dsk, dout, H, D, T, 1.f / std::sqrt(512.f), 0);
+        Vec batt = host(dout, T * H * D), satt;
+        for (int t = 0; t < T; ++t) {
+            std::vector<int> wa(na[t]);
+            for (int j = 0; j < na[t]; ++j) wa[j] = a0[t] + j;
+            int * dwa = dev(wa);
+            float * o = dev(Vec(H * D));
+            attention_sink(dq + static_cast<size_t>(t) * H * D, dA, dwa, na[t], dB, dib + t * 512, nb[t], dsk, o, H, D, 1.f / std::sqrt(512.f), 0);
+            for (float v : host(o, H * D)) satt.push_back(v);
+        }
+        check("rows attention", batt, satt, 0.f);
+    }
     {   // swiglu_clamp
         const int n = 2304;
         Vec g = rnd(n, 8.f), u = rnd(n, 8.f), want(n);

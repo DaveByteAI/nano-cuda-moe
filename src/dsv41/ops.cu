@@ -56,6 +56,11 @@ __global__ void rope_tail_k(float * x, int D, int n_rot, int pos, const float * 
 // one block: the rms of the flattened stream, then one thread does the split and the Sinkhorn iterations
 __global__ void hc_split_k(const float * m, const float * R, const float * scale, const float * base, int hc, int n,
                            float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb) {
+    {   // row blockIdx.x of a batch (one block per token)
+        const int t = blockIdx.x, mix = (2 + hc) * hc;
+        m += static_cast<size_t>(t) * mix; R += static_cast<size_t>(t) * n;
+        pre += t * hc; post += t * hc; comb += t * hc * hc;
+    }
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += R[i] * R[i];
     ss = block_sum(ss);
@@ -116,6 +121,8 @@ __global__ void hc_post_k(const float * h, const float * res, const float * post
 // one block per hc copy
 __global__ void engram_gate_k(float * R, const float * kv, const float * qk, int hc, int D, float eps) {
     const int c = blockIdx.x;
+    R += static_cast<size_t>(blockIdx.y) * hc * D;           // token blockIdx.y of a batch
+    kv += static_cast<size_t>(blockIdx.y) * (hc + 1) * D;
     float * x = R + static_cast<size_t>(c) * D;
     const float * key = kv + static_cast<size_t>(c) * D;
     const float * w = qk + static_cast<size_t>(c) * D;
@@ -197,6 +204,9 @@ __global__ void indexer_score_k(const float * q, const float * w, float wscale, 
 
 // one block of n threads (n <= 1024): the k largest of s + bias, one argmax round each
 __global__ void router_topk_k(const float * logits, const float * bias, int n, int k, float scale, int * ids, float * w) {
+    logits += static_cast<size_t>(blockIdx.x) * n;   // token blockIdx.x of a batch
+    ids += blockIdx.x * k;
+    w += blockIdx.x * k;
     __shared__ float sel[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -313,6 +323,106 @@ __global__ void swiglu_clamp_k(const float * g, const float * u, float * out, in
     out[i] = gg / (1.f + expf(-gg)) * uu;
 }
 
+// ---------------------------------------------------------------- batched (prefill) versions
+
+__global__ void rope_tail_rows_k(float * x, int heads, int D, int n_rot, int pos0, int step, const float * freq, float sign) {
+    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x;
+    if (i >= n_rot / 2) return;
+    float * p = x + (static_cast<size_t>(t) * heads + h) * D + (D - n_rot) + 2 * i;
+    const float ang = static_cast<float>(pos0 + t * step) * freq[i];
+    float sn, cs;
+    sincosf(ang, &sn, &cs);
+    sn *= sign;
+    const float a = p[0], b = p[1];
+    p[0] = a * cs - b * sn;
+    p[1] = a * sn + b * cs;
+}
+
+__global__ void hc_pre_rows_k(const float * R, const float * pre, float * out, int hc, int D) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (d >= D) return;
+    const float * r = R + static_cast<size_t>(t) * hc * D;
+    float s = 0.f;
+    for (int j = 0; j < hc; ++j) s += pre[t * hc + j] * r[static_cast<size_t>(j) * D + d];
+    out[static_cast<size_t>(t) * D + d] = s;
+}
+
+__global__ void hc_post_rows_k(const float * h, const float * res, const float * post, const float * comb, float * out, int hc,
+                               int D) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, k = blockIdx.y, t = blockIdx.z;
+    if (d >= D) return;
+    const float * r = res + static_cast<size_t>(t) * hc * D;
+    const float * cm = comb + static_cast<size_t>(t) * hc * hc;
+    float s = post[t * hc + k] * h[static_cast<size_t>(t) * D + d];
+    for (int j = 0; j < hc; ++j) s += cm[j * hc + k] * r[static_cast<size_t>(j) * D + d];
+    out[(static_cast<size_t>(t) * hc + k) * D + d] = s;
+}
+
+__global__ void indexer_score_rows_k(const float * q, const float * w, float wscale, const float * keys, const int * n_vis, int H,
+                                     int Di, float * out, int ld) {
+    const int t = blockIdx.y, j = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (j >= n_vis[t]) return;
+    const float * k = keys + static_cast<size_t>(j) * Di;
+    const float * qt = q + static_cast<size_t>(t) * H * Di;
+    float acc = 0.f;
+    for (int h = 0; h < H; ++h) {
+        float sum = 0.f;
+        for (int i = lane; i < Di; i += 32) sum += qt[static_cast<size_t>(h) * Di + i] * k[i];
+        sum = warp_sum(sum);
+        acc += fmaxf(sum, 0.f) * w[t * H + h];
+    }
+    if (lane == 0) out[static_cast<size_t>(t) * ld + j] = acc * wscale;
+}
+
+__global__ void attention_sink_rows_k(const float * q, const float * A, const int * a0, const int * na, const float * B,
+                                      const int * idx_b, int ldb, const int * nb, const float * sink, float * out, int H, int D,
+                                      float scale) {
+    extern __shared__ float sm[];
+    const int h = blockIdx.x, t = blockIdx.y;
+    const int n_a = na[t], n_b = nb[t], base_a = a0[t], n = n_a + n_b;
+    const int * ib = idx_b + static_cast<size_t>(t) * ldb;
+    float * qs = sm;
+    float * sc = sm + D;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const float * qh = q + (static_cast<size_t>(t) * H + h) * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) qs[i] = qh[i];
+    __syncthreads();
+    auto key = [&](int j) -> const float * {
+        return j < n_a ? A + static_cast<size_t>(base_a + j) * D : B + static_cast<size_t>(ib[j - n_a]) * D;
+    };
+    for (int j = warp; j < n; j += nw) {
+        const float * k = key(j);
+        float sum = 0.f;
+        for (int i = lane; i < D; i += 32) sum += qs[i] * k[i];
+        sum = warp_sum(sum);
+        if (lane == 0) sc[j] = sum * scale;
+    }
+    __syncthreads();
+    float mx = sink[h];
+    for (int j = threadIdx.x; j < n; j += blockDim.x) mx = fmaxf(mx, sc[j]);
+    mx = block_max(mx);
+    float z = 0.f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) z += (sc[j] = expf(sc[j] - mx));
+    z = block_sum(z) + expf(sink[h] - mx);
+    __syncthreads();
+    const float inv = 1.f / z;
+    float * o = out + (static_cast<size_t>(t) * H + h) * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j < n; ++j) acc += sc[j] * key(j)[i];
+        o[i] = acc * inv;
+    }
+}
+
+__global__ void pool2_rows_k(const float * kv, const float * score, float * out, int D) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, g = blockIdx.y;
+    if (d >= D) return;
+    const float * k0 = kv + static_cast<size_t>(2 * g) * D, * s0 = score + static_cast<size_t>(2 * g) * D;
+    const float a = s0[d], b = s0[D + d], mx = fmaxf(a, b);
+    const float e0 = expf(a - mx), e1 = expf(b - mx);
+    out[static_cast<size_t>(g) * D + d] = (k0[d] * e0 + k0[D + d] * e1) / (e0 + e1);
+}
+
 }  // namespace
 
 void rope_tail(float * x, int heads, int D, int n_rot, int pos, const float * freq, bool inverse, cudaStream_t s) {
@@ -364,6 +474,42 @@ void topk_sorted(const float * score, int n, int k, int * out, cudaStream_t s) {
 
 void swiglu_clamp(const float * g, const float * u, float * out, int n, float limit, cudaStream_t s) {
     swiglu_clamp_k<<<(n + 255) / 256, 256, 0, s>>>(g, u, out, n, limit);
+}
+
+void rope_tail_rows(float * x, int T, int heads, int D, int n_rot, int pos0, int step, const float * freq, bool inverse,
+                    cudaStream_t s) {
+    if (T > 0) rope_tail_rows_k<<<dim3(heads, T), 32 * ((n_rot / 2 + 31) / 32), 0, s>>>(x, heads, D, n_rot, pos0, step, freq, inverse ? -1.f : 1.f);
+}
+void hc_split_rows(const float * m, const float * R, const float * scale, const float * base, int hc, int D, int T,
+                   float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb, cudaStream_t s) {
+    if (T > 0) hc_split_k<<<T, 256, 0, s>>>(m, R, scale, base, hc, hc * D, norm_eps, hc_eps, iters, pre, post, comb);
+}
+void hc_pre_rows(const float * R, const float * pre, float * out, int hc, int D, int T, cudaStream_t s) {
+    if (T > 0) hc_pre_rows_k<<<dim3((D + 255) / 256, T), 256, 0, s>>>(R, pre, out, hc, D);
+}
+void hc_post_rows(const float * h, const float * res, const float * post, const float * comb, float * out, int hc, int D,
+                  int T, cudaStream_t s) {
+    if (T > 0) hc_post_rows_k<<<dim3((D + 255) / 256, hc, T), 256, 0, s>>>(h, res, post, comb, out, hc, D);
+}
+void engram_gate_rows(float * R, const float * kv, const float * qk, int hc, int D, int T, float eps, cudaStream_t s) {
+    if (T > 0) engram_gate_k<<<dim3(hc, T), 256, 0, s>>>(R, kv, qk, hc, D, eps);
+}
+void router_topk_rows(const float * logits, const float * bias, int n, int k, float scale, int T, int * ids, float * w,
+                      cudaStream_t s) {
+    if (T > 0) router_topk_k<<<T, 32 * ((n + 31) / 32), 0, s>>>(logits, bias, n, k, scale, ids, w);
+}
+void indexer_score_rows(const float * q, const float * w, float wscale, const float * keys, const int * n_vis, int n_max,
+                        int H, int Di, int T, float * out, int ld, cudaStream_t s) {
+    if (T > 0 && n_max > 0) indexer_score_rows_k<<<dim3((n_max + 7) / 8, T), 256, 0, s>>>(q, w, wscale, keys, n_vis, H, Di, out, ld);
+}
+void attention_sink_rows(const float * q, const float * A, const int * a0, const int * na, const float * B, const int * idx_b,
+                         int ldb, const int * nb, int n_max, const float * sink, float * out, int H, int D, int T, float scale,
+                         cudaStream_t s) {
+    if (T > 0)
+        attention_sink_rows_k<<<dim3(H, T), 256, sizeof(float) * (D + n_max), s>>>(q, A, a0, na, B, idx_b, ldb, nb, sink, out, H, D, scale);
+}
+void pool2_rows(const float * kv, const float * score, float * out, int D, int n, cudaStream_t s) {
+    if (n > 0) pool2_rows_k<<<dim3((D + 255) / 256, n), 256, 0, s>>>(kv, score, out, D);
 }
 
 }  // namespace bl::cuda::dsv41
