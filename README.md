@@ -7,12 +7,18 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#performance">Performance</a> ·
+  <a href="#deepseek-v41-flash-dsv41-branch">DeepSeek-V4.1-Flash</a> ·
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-Run **Qwen3.8-Flash-Next**, a 125-billion-parameter Mixture-of-Experts model, on **one 24 GB RTX 3090 and 64 GB of
-RAM** at about **97 tokens per second**. The engine is C++ and CUDA written for this model: one process, no Python or
-ML framework at inference time, an OpenAI-compatible server and a chat page included.
+Run large Mixture-of-Experts models on **one 24 GB RTX 3090 and 64 GB of RAM**. The engine is C++ and CUDA written
+for each model: one process, no Python or ML framework at inference time, an OpenAI-compatible server and a chat page
+included. Two models so far:
+
+| Model | Model file | Where the experts live | Decode on a 3090 + 64 GB | Branch |
+|---|---|---|---|---|
+| [**Qwen3.8-Flash-Next**](#highlights) (125B, 6B active) | 76 GB, IQ3_XXS | VRAM + RAM | **~97 tok/s** | `main` (this page) |
+| [**DeepSeek-V4.1-Flash-1017**](#deepseek-v41-flash-dsv41-branch) | 359 GB, 2-bit experts (IQ2_XXS) | VRAM + RAM + NVMe | **8-12 tok/s** (~20 on repetitive output) | [`dsv41`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41) |
 
 This is the CUDA counterpart of [**nano-metal-moe-qwen36**](https://github.com/DaveByteAI/nano-metal-moe-qwen36),
 which runs Qwen3.6-35B-A3B on a 16 GB Mac mini with Metal. Both start from the same observation: a MoE model needs
@@ -25,6 +31,9 @@ experts that are used most.
 </picture>
 
 ## Highlights
+
+Qwen3.8-Flash-Next (DeepSeek-V4.1 is [further down](#deepseek-v41-flash-dsv41-branch)):
+
 
 - **125B model, 24 GB card.** The 42.9 GB of experts live in pinned RAM. The GPU keeps the dense weights (4.1 GB) and
   a per-layer LRU cache of about 10,000 of the 25,088 experts (~17.5 GB), which serves ~90% of the experts a token
@@ -144,6 +153,32 @@ in the chat: `/reset`, `/think low`, `/temp 0.3`, `/stats`, `/exit`.
 **Several GPUs (experimental)**: on the [`multi-gpu`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/multi-gpu)
 branch, `--gpus 0,1` splits the layers between the cards. So far checked only as two stages on one GPU, not yet on two
 real GPUs; reports are welcome.
+
+## DeepSeek-V4.1-Flash (`dsv41` branch)
+
+The [`dsv41` branch](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41) runs [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+from acrogenesis' [IQ2_XXS GGUF](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF) on the same
+machine, with the same `bl-server` and `bl-chat`. The file is 359 GB, five times the RAM: 140 GB of 2-bit experts and
+209 GB of Engram n-gram tables. The experts live in three tiers (~1,700 in VRAM, ~5,700 in a pinned RAM pool, the rest
+read from the NVMe as tokens need them); the GPU computes the experts it holds while the CPU computes the misses, and
+the experts two layers ahead are read from the disk early.
+
+| | |
+|---|---|
+| Chat in the web page (temperature 0.7) | 8.3 tok/s |
+| New text fed token by token (Chinese / English / CUDA code) | 9.9 / 9.6 / 11.7 tok/s |
+| llama.cpp (the DeepSeek-V4.1 PR), same machine and file | 0.97 tok/s |
+| A 1,000-token prompt / startup | 59 s / ~40 s |
+
+Limits: 2-bit experts (answers below the official model's), context up to 16K, no tool calls. Setup, the design and
+every measurement: the branch's [README](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41#deepseek-v41-flash) and
+[optimization log](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41/docs/LOG.md).
+
+```bash
+git checkout dsv41 && cmake -B build && cmake --build build -j
+scripts/download_dsv41.sh all        # 359 GB
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
+```
 
 ## Checking accuracy and speed
 

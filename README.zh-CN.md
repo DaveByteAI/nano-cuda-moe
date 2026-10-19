@@ -7,12 +7,17 @@
   <a href="#快速开始">快速开始</a> ·
   <a href="#原理">原理</a> ·
   <a href="#性能">性能</a> ·
+  <a href="#deepseek-v41-flashdsv41-分支">DeepSeek-V4.1-Flash</a> ·
   <a href="README.md">English</a>
 </p>
 
-在**一张 24 GB 的 RTX 3090、64 GB 内存**的普通电脑上，以**每秒约 97 个 token** 的速度运行 **Qwen3.8-Flash-Next**，
-一个 1250 亿参数的混合专家（MoE）模型。引擎是为这个模型专门写的 C++ 和 CUDA：推理时只有一个进程，不需要 Python
-或任何机器学习框架；自带 OpenAI 兼容的服务和聊天网页。
+在**一张 24 GB 的 RTX 3090、64 GB 内存**的普通电脑上运行大型混合专家（MoE）模型。引擎是为每个模型专门写的 C++ 和
+CUDA：推理时只有一个进程，不需要 Python 或任何机器学习框架；自带 OpenAI 兼容的服务和聊天网页。目前支持两个模型：
+
+| 模型 | 模型文件 | 专家放在哪 | 3090 + 64 GB 上的生成速度 | 分支 |
+|---|---|---|---|---|
+| [**Qwen3.8-Flash-Next**](#亮点)（125B，激活 6B） | 76 GB，IQ3_XXS | 显存 + 内存 | **约 97 tok/s** | `main`（本页） |
+| [**DeepSeek-V4.1-Flash-1017**](#deepseek-v41-flashdsv41-分支) | 359 GB，专家 2 bit（IQ2_XXS） | 显存 + 内存 + NVMe | **8–12 tok/s**（重复性输出约 20） | [`dsv41`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41) |
 
 它是 [**nano-metal-moe-qwen36**](https://github.com/DaveByteAI/nano-metal-moe-qwen36) 的 CUDA 版本。那个项目用
 Metal 在 16 GB 的 Mac mini 上运行 Qwen3.6-35B-A3B。两者出发点相同：MoE 模型的全部专家都得有地方放，但每个 token
@@ -24,6 +29,9 @@ Metal 在 16 GB 的 Mac mini 上运行 Qwen3.6-35B-A3B。两者出发点相同�
 </picture>
 
 ## 亮点
+
+以下讲的是 Qwen3.8-Flash-Next；DeepSeek-V4.1 见[后面](#deepseek-v41-flashdsv41-分支)。
+
 
 - **125B 的模型，24 GB 的卡。** 42.9 GB 的专家放在锁页内存里。显卡上放稠密权重（4.1 GB），再加上每层一个 LRU
   专家缓存，装得下 25,088 个专家中的约 1 万个（约 17.5 GB），能满足一个 token 所需专家的约 90%。
@@ -137,6 +145,30 @@ build/bl-server --model models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002
 
 **多块 GPU（实验性）**：在 [`multi-gpu`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/multi-gpu) 分支，
 加 `--gpus 0,1` 把层分给几张卡。目前只在单卡上模拟验证过，还没在两张真卡上测过，欢迎反馈。
+
+## DeepSeek-V4.1-Flash（dsv41 分支）
+
+[`dsv41` 分支](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41)在同一台机器上、用同一套 `bl-server` 和 `bl-chat` 运行
+[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)（acrogenesis 的
+[IQ2_XXS GGUF](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF)）。文件 359 GB，是内存的 5 倍多：
+2 bit 的专家 140 GB，Engram n-gram 表 209 GB。专家分三层存（显存约 1,700 个、锁页内存约 5,700 个、其余在 token 需要时从
+NVMe 读）；GPU 算显存里有的专家，CPU 同时算没命中的，后面两层要用的专家提前从盘里读。
+
+| | |
+|---|---|
+| 网页聊天（温度 0.7） | 8.3 tok/s |
+| 新内容逐 token 喂入（中文 / 英文 / CUDA 代码） | 9.9 / 9.6 / 11.7 tok/s |
+| llama.cpp（DeepSeek-V4.1 的 PR），同一台机器、同一个文件 | 0.97 tok/s |
+| 1,000 个 token 的提示词 / 启动 | 59 s / 约 40 s |
+
+限制：专家是 2 bit（回答质量比官方原版低），上下文最多 16K，没有工具调用。安装、设计和每一步的测量见分支上的
+[README](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41/README.zh-CN.md#deepseek-v41-flash) 和[优化日志](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41/docs/LOG.md)。
+
+```bash
+git checkout dsv41 && cmake -B build && cmake --build build -j
+scripts/download_dsv41.sh all        # 359 GB
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
+```
 
 ## 测速度和精度
 
