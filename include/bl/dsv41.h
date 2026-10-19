@@ -84,6 +84,11 @@ public:
     using Probe = std::function<void(const std::string & name, const float * dev, int n)>;
     void set_probe(Probe p);
 
+    // fills the expert tiers from a usage profile (tools/dsv41_profile.py: "layer expert count" lines, most used first):
+    // the VRAM cache now (reads in parallel, then the copies), the RAM tier in the background (behind any demanded
+    // read). Returns the experts placed in VRAM.
+    int warm(const std::string & profile);
+
     std::string report() const;   // where the time went
     void reset_stats();
 

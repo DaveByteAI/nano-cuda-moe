@@ -699,6 +699,59 @@ struct Dsv41Engine::Impl {
         }
     }
 
+    int warm(const std::string & path) {
+        std::FILE * f = std::fopen(path.c_str(), "r");
+        if (!f) return 0;
+        std::vector<int> order;   // keys, most used first
+        char line[128];
+        while (std::fgets(line, sizeof line, f)) {
+            int il, e, n;
+            if (line[0] == '#' || std::sscanf(line, "%d %d %d", &il, &e, &n) != 3) continue;
+            if (il >= 0 && il < c.n_layer && e >= 0 && e < c.n_expert) order.push_back(il * c.n_expert + e);
+        }
+        std::fclose(f);
+        // VRAM: the most used, leaving the free-slot pool; read 64 at a time into RAM, copied over, then out of RAM
+        const int nv = std::min<int>(order.size(), static_cast<int>(lru.size()) - free_target - c.n_expert_used);
+        int placed = 0;
+        for (int b = 0; b < nv; b += 64) {
+            const int n = std::min(64, nv - b);
+            for (int i = 0; i < n; ++i) {
+                const int key = order[b + i], il = key / c.n_expert, e = key % c.n_expert;
+                if (where.count(key)) continue;
+                expert_slot(il, e);   // RAM (read if needed) -> VRAM on st
+                ++placed;
+            }
+            ck(cudaStreamSynchronize(st), "warm");
+            if (exclusive)
+                for (int i = 0; i < n; ++i) ram->drop(order[b + i], nullptr);
+        }
+        // RAM: the next ones in the background, up to 90% of the pool (demanded reads go first)
+        std::vector<int> keys;
+        std::vector<ExpertRam::Src> src;
+        const int nr = static_cast<int>(ram->slots() * 0.9);
+        for (size_t i = nv; i < order.size() && static_cast<int>(keys.size()) < nr; ++i) {
+            const int key = order[i];
+            if (where.count(key) || ram->contains(key)) continue;
+            keys.push_back(key);
+            src.push_back(src_of(key / c.n_expert, key % c.n_expert));
+        }
+        // read now, 256 at a time (a background fill competes with the first replies for the disk); BL_DSV41_WARM_BG=1:
+        // in the background instead
+        if (std::getenv("BL_DSV41_WARM_BG")) {
+            if (!keys.empty()) ram->prefetch(keys.data(), src.data(), static_cast<int>(keys.size()));
+        } else {
+            std::vector<const uint8_t *> out(256);
+            for (size_t b = 0; b < keys.size(); b += 256) {
+                const int n = static_cast<int>(std::min<size_t>(256, keys.size() - b));
+                ram->fetch(keys.data() + b, src.data() + b, n, out.data());
+            }
+        }
+        hits = misses = 0;
+        ram->hits = ram->reads = 0;
+        ram->read_s = 0;
+        return placed;
+    }
+
     // the LRU tail out of VRAM into the free list (copied back to RAM first when exclusive)
     void free_vslot() {
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
@@ -1669,6 +1722,7 @@ int Dsv41Engine::position() const { return static_cast<int>(p_->toks.size()); }
 const std::vector<float> & Dsv41Engine::step(int token) { return p_->step(token); }
 const std::vector<float> & Dsv41Engine::prefill(const std::vector<int> & t, std::vector<float> * all) { return p_->prefill(t, all); }
 void Dsv41Engine::set_probe(Probe p) { p_->probe = std::move(p); }
+int Dsv41Engine::warm(const std::string & profile) { return p_->warm(profile); }
 void Dsv41Engine::reset_stats() {
     auto & q = *p_;
     q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_router = q.t_admit = q.t_prefill = 0;

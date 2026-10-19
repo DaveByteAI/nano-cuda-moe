@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <numeric>
 #include <random>
@@ -11,6 +12,8 @@
 #include "bl/chat.h"
 #include "bl/dsv41.h"
 #include "gguf.h"
+
+#include <unistd.h>
 
 namespace bl {
 
@@ -69,6 +72,25 @@ public:
         // (hybrid decode unless the environment says otherwise: the exact fp32 path is for comparisons)
         const auto ids = text_.tokenize("</think>");
         if (ids.size() == 1) think_end_ = ids[0];
+        // the expert tiers warmed from the usage profile: BL_DSV41_PROFILE, else bench/dsv41/expert_profile.txt next to
+        // the build directory of this executable ("none": cold start)
+        std::string prof = std::getenv("BL_DSV41_PROFILE") ? std::getenv("BL_DSV41_PROFILE") : "";
+        if (prof.empty()) {
+            char exe[4096];
+            const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+            if (n > 0) {
+                std::string d(exe, static_cast<size_t>(n));
+                d = d.substr(0, d.rfind('/'));
+                prof = d.substr(0, d.rfind('/')) + "/bench/dsv41/expert_profile.txt";
+            }
+        }
+        if (prof != "none") {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int placed = eng_.warm(prof);
+            if (placed > 0)
+                std::fprintf(stderr, "dsv41: expert tiers warmed in %.0f s (%d in VRAM) from %s\n",
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), placed, prof.c_str());
+        }
     }
     void        reset() override { eng_.reset(); session_.clear(); pending_ = -1; }
     int         position() const override { return eng_.position() + (pending_ >= 0 ? 1 : 0); }
