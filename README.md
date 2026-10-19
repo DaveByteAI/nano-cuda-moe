@@ -7,12 +7,21 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#performance">Performance</a> ·
+  <a href="#deepseek-v41-flash">DeepSeek-V4.1-Flash</a> ·
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-Run **Qwen3.8-Flash-Next**, a 125-billion-parameter Mixture-of-Experts model, on **one 24 GB RTX 3090 and 64 GB of
-RAM** at about **97 tokens per second**. The engine is C++ and CUDA written for this model: one process, no Python or
-ML framework at inference time, an OpenAI-compatible server and a chat page included.
+Run large Mixture-of-Experts models on **one 24 GB RTX 3090 and 64 GB of RAM**. The engine is C++ and CUDA written
+for each model: one process, no Python or ML framework at inference time, an OpenAI-compatible server and a chat page
+included. Two models so far; the same `bl-server` and `bl-chat` run both and pick the engine from the GGUF file:
+
+| Model | Model file | Where the experts live | Decode on a 3090 + 64 GB | |
+|---|---|---|---|---|
+| [**Qwen3.8-Flash-Next**](#highlights) (125B, 6B active) | 76 GB, IQ3_XXS | VRAM + RAM | **~97 tok/s** | `main` and `dsv41` branches |
+| [**DeepSeek-V4.1-Flash-1017**](#deepseek-v41-flash) | 359 GB, 2-bit experts (IQ2_XXS) | VRAM + RAM + NVMe | **8-12 tok/s** (~20 on repetitive output) | this `dsv41` branch |
+
+DeepSeek-V4.1-Flash's file is five times the RAM: most of it streams from the NVMe while the model runs. On the same
+machine and file, llama.cpp decodes it at about 1 token/s.
 
 This is the CUDA counterpart of [**nano-metal-moe-qwen36**](https://github.com/DaveByteAI/nano-metal-moe-qwen36),
 which runs Qwen3.6-35B-A3B on a 16 GB Mac mini with Metal. Both start from the same observation: a MoE model needs
@@ -25,6 +34,9 @@ experts that are used most.
 </picture>
 
 ## Highlights
+
+Qwen3.8-Flash-Next (the next sections up to [Usage](#usage); DeepSeek-V4.1 has [its own](#deepseek-v41-flash)):
+
 
 - **125B model, 24 GB card.** The 42.9 GB of experts live in pinned RAM. The GPU keeps the dense weights (4.1 GB) and
   a per-layer LRU cache of about 10,000 of the 25,088 experts (~17.5 GB), which serves ~90% of the experts a token
@@ -141,22 +153,74 @@ fishing" works.
 `bl-chat --model SHARD1 [--ctx N] [--temp 0.7] [--top-p 0.8] [--top-k 20] [--spec 3] [--think off|low|medium|xhigh] [--system TEXT]`;
 in the chat: `/reset`, `/think low`, `/temp 0.3`, `/stats`, `/exit`.
 
-**DeepSeek-V4.1-Flash** (`dsv41` branch; [docs/DSV41.md](docs/DSV41.md)): the same `bl-chat` and `bl-server` run
-acrogenesis' `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram` GGUF (10 files, 359 GB, the Engram tables
-included; `scripts/download_dsv41.sh`), picked by the file's architecture:
-
-```bash
-build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
-```
-
-Its 140 GB of experts live in three tiers (VRAM, a pinned RAM pool, the NVMe), so the first ~40 s go to warming the
-first two from `bench/dsv41/expert_profile.txt` (`BL_DSV41_PROFILE=none` skips it). On a 3090 + 62 GB RAM it decodes
-9-12 tokens/s on new text and ~20 on repetitive output, and prefills ~17 tokens/s on a 1K prompt. The template has
-no tool calls; thinking (`--think` / `enable_thinking`) uses the release's `<think>` prompt.
-
 **Several GPUs (experimental)**: on the [`multi-gpu`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/multi-gpu)
 branch, `--gpus 0,1` splits the layers between the cards. So far checked only as two stages on one GPU, not yet on two
 real GPUs; reports are welcome.
+
+## DeepSeek-V4.1-Flash
+
+[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) through acrogenesis'
+[IQ2_XXS GGUF](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF): 40 layers of 384 experts
+(6 per token) with hyper-connections, compressed sparse attention and two Engram n-gram tables. The file is 359 GB:
+140 GB of 2-bit experts (15,360 of them, 9.1 MB each), 7.6 GB of Q8_0 dense weights, 209 GB of Engram tables. The
+model description and the forward pass, checked against the official code: [docs/DSV41.md](docs/DSV41.md) (Chinese).
+
+### How it fits
+
+- **Three tiers for the experts.** VRAM keeps ~1,700 of them (LRU), a pinned RAM pool ~5,700 more (52 GB on a 64 GB
+  machine), and the rest are read from the NVMe when a token needs them (O_DIRECT, two threads, 1.5 MB requests:
+  this SSD gets slower with more in flight). VRAM and RAM hold different experts, so together they cover half the model.
+- **GPU and CPU at the same time.** In each layer the GPU computes the experts it holds while 8 CPU threads compute the
+  misses straight from RAM; copying a 9 MB expert over PCIe would cost more than computing it on the CPU.
+- **Reading ahead.** The router of layer *i*+2 applied to layer *i*'s input predicts its experts well enough that the
+  top 2 are fetched from disk two layers early. An expert enters VRAM only on its second miss within the last 1,000, which
+  halves the 9 MB-in, 9 MB-out traffic of admissions.
+- **Small copies never queue behind big ones.** Router results and flags move through a kernel on mapped host memory,
+  not the copy engines, which are busy with expert copies (+12%).
+- **Engram on the NVMe.** Its rows depend only on the token ids, so all 48 reads of a token start before layer 0.
+- **Prompts** go in one chunk of up to 4,096 tokens, borrowing VRAM cache segments for the activations; the RAM tier is
+  frozen meanwhile, since a scan over every expert is LRU's worst case.
+
+### Performance
+
+RTX 3090 24 GB, Core i7-10700, 64 GB DDR4, an NVMe SSD; greedy unless noted.
+
+| | |
+|---|---|
+| Chat in the web page (temperature 0.7, an 883-token reply) | 8.3 tok/s |
+| New text fed token by token (Chinese / English / CUDA code, 512 tokens each) | 9.9 / 9.6 / 11.7 tok/s |
+| Repetitive output | ~20 tok/s |
+| llama.cpp (the DeepSeek-V4.1 PR), same machine and file, experts on the CPU | 0.97 tok/s |
+| A 1,000-token prompt | 59 s (~17 tok/s) |
+| Startup, warming the VRAM and RAM tiers from a usage profile | ~40 s |
+
+Each token reads about 13 experts from the disk; more RAM means fewer reads (simulated: ~14 tok/s with 96 GB, ~17
+with 128 GB). The [optimization log](docs/LOG.md) has every step from 4.9 to 10 tok/s, and the ones that did not work.
+
+### Run it
+
+Needs, besides the build requirements above: 64 GB of RAM and ~360 GB of disk, NVMe for the experts (the Engram files
+can be on a slower disk: `ENGRAM_DIR`).
+
+```bash
+git checkout dsv41 && cmake -B build && cmake --build build -j
+scripts/download_dsv41.sh all        # 359 GB into models/DSV41-IQ2_XXS (resumable, SHA-256 checked)
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
+build/bl-chat   --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf
+```
+
+Thinking (`--think`, `enable_thinking`) uses the release's `<think>` prompt. `bl-dsv41 --tokens-file F --force 64
+--stats-after 128` is the speed benchmark (`bench/dsv41/`); the tuning variables are in [docs/DSV41.md](docs/DSV41.md).
+
+### Limits
+
+- **2-bit experts.** IQ2_XXS is what makes 140 GB of experts possible here; answers are below the official model's.
+- **Context up to 16K** for now (the two-level candidate selection past 16K positions is not implemented).
+- **No tool calls** (the GGUF's chat template has none).
+- **No speculative decoding.** The model's own draft (DSpark, 3 layers, not in this GGUF) is packed from the official
+  weights by `bl-dspark-pack` and guesses well (3.25 of 5 tokens accepted), but checking 6 tokens at once touches
+  ~21 different experts per layer instead of 6 and costs 8.5 single steps here. It pays off only when the model fits in
+  VRAM.
 
 ## Checking accuracy and speed
 
@@ -194,15 +258,18 @@ work; [docs/MODEL.md](docs/MODEL.md) describes the model.
 ## Repository layout
 
 ```
-src/            the engine: engine.cpp (scheduling, caches, prefill, MTP), cuda/ (kernels), cpu_*.cpp (AVX2 experts)
+src/            the Qwen3.8 engine: engine.cpp (scheduling, caches, prefill, MTP), cuda/ (kernels), cpu_*.cpp (AVX2 experts);
+                chat_models.cpp (bl-chat / bl-server pick the engine by the GGUF's architecture)
+src/dsv41/      the DeepSeek-V4.1 engine: engine.cpp, ops.cu, ram_tier.cpp (pinned RAM pool, NVMe reads)
 include/bl/     its interfaces
-tools/          bl-server, bl-chat, bl-run, bl-tok, bl-ref-dump, bl-mtp-pack; fetch_mtp.py, make_rank.py, make_draft_vocab.py
+tools/          bl-server, bl-chat, bl-run, bl-tok, bl-ref-dump, bl-mtp-pack; fetch_mtp.py, make_rank.py, make_draft_vocab.py;
+                bl-dsv41, bl-dspark-pack, dsv41_*.py, dspark_ref.py
 tests/          correctness tests and kernel benchmarks
 web/            the chat page (served by bl-server)
 data/           expert-rank.bin (the cache's starting order), draft-vocab.bin (the MTP head's vocabulary)
-bench/          the benchmark inputs and their generators
-scripts/        download_model.sh
-docs/           LOG.md (optimization log), MODEL.md, assets/ (figures: make_figures.py)
+bench/          the benchmark inputs and their generators; dsv41/ (DeepSeek texts, expert usage profile)
+scripts/        download_model.sh, download_dsv41.sh, qwen_regression.sh
+docs/           LOG.md (optimization log), MODEL.md, DSV41.md, assets/ (figures: make_figures.py)
 ```
 
 ## Credits
@@ -210,6 +277,9 @@ docs/           LOG.md (optimization log), MODEL.md, assets/ (figures: make_figu
 - **Model:** [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; the GSQ-RCO
   quantization by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF). Their licenses
   apply to the model files, which are not part of this repository.
+- **Model:** [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) by DeepSeek; the
+  IQ2_XXS GGUF by [acrogenesis](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF); the llama.cpp
+  DeepSeek-V4.1 pull request (#28696) as the numerical reference.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the quantization formats and codebooks, the CPU
   dot products, the tokenizer, and the reference implementation every result is checked against.
 
