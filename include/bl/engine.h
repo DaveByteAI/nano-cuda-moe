@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,16 @@ struct Sampling {
     int      top_k = 40;      // at most 256 candidates either way
     uint64_t seed = 0;        // 0: keep the engine's random stream going
 };
+
+// a context length as the tools take it: tokens, or with a k suffix (x 1024): "32768", "64k", "128k", "256k"
+inline int parse_ctx(const std::string & s) {
+    size_t n = 0;
+    const long v = std::stol(s, &n);
+    const std::string rest = s.substr(n);
+    if (rest.empty()) return static_cast<int>(v);
+    if (rest == "k" || rest == "K") return static_cast<int>(v * 1024);
+    throw std::invalid_argument("--ctx " + s + ": a number of tokens, or with k (64k, 128k, 256k)");
+}
 
 class Engine {
 public:

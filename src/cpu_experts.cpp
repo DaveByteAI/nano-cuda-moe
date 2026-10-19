@@ -31,7 +31,9 @@ struct CpuExperts::Impl {
     std::atomic<int>      done{0};
     std::atomic<bool>     quit{false};
     std::atomic<int>      sleepers{0};   // workers parked in ticket.wait (idle for a while)
-    static constexpr int  kSpins = 200000;   // pause()s before an idle worker parks (~ a few hundred us)
+    // pause()s before an idle worker parks (a pause is ~140 cycles on this CPU: 200000 is ~10 ms);
+    // BL_CPU_SPINS overrides
+    const int kSpins = std::getenv("BL_CPU_SPINS") ? std::atoi(std::getenv("BL_CPU_SPINS")) : 200000;
     uint32_t              phase_id = 0;
     int                   n_tasks = 0;
     void (*fn)(Impl *, int task) = nullptr;
@@ -41,6 +43,11 @@ struct CpuExperts::Impl {
     size_t gu_bytes = 0, gu_rb = 0, d_rb = 0, xq_rb = 0, aq_rb = 0;
     int F = 0, D = 0, n = 0, T = 1;
     bool q2_down = false;            // down is Q2_0: our AVX2 kernel (ggml's is scalar on x86)
+    float limit = 0.f;               // > 0: DeepSeek-V4's clamps, gate at most limit, up within +-limit
+    float swiglu(float g, float u) const {
+        if (limit > 0.f) { g = std::fmin(g, limit); u = std::fmin(std::fmax(u, -limit), limit); }
+        return g / (1.f + std::exp(-g)) * u;
+    }
     uint32_t type_gu = 0;
     bool iq_gu = false;              // gate/up through cpu_iq (all of a job's tokens per row) instead of ggml's vec_dot
     const float * x = nullptr;
@@ -137,7 +144,7 @@ struct CpuExperts::Impl {
     // rows r0.. of job e's gate and up, for every token in its mask (the rows stay in cache across the tokens)
     static void gate_up_task(Impl * I, int task) {
         const int per = I->F / kGuRows, e = task / per, r0 = (task % per) * kGuRows;
-        const uint8_t * g = I->jobs[e].base, * u = g + I->gu_bytes;
+        const uint8_t * g = I->jobs[e].base, * u = I->jobs[e].up ? I->jobs[e].up : g + I->gu_bytes;
         const int mask = I->jobs[e].mask;
         if (I->iq_gu && __builtin_popcount(static_cast<unsigned>(mask)) >= 2) {   // each row decoded once for all the job's tokens
             // (one token: ggml's vec_dot below is as fast or faster)
@@ -149,7 +156,7 @@ struct CpuExperts::Impl {
             for (int r = r0; r < r0 + kGuRows; ++r) {
                 cpu::iq_gate_up(I->type_gu, g + r * I->gu_rb, u + r * I->gu_rb, I->D, xs, nt, gv, uv);
                 for (int k = 0; k < nt; ++k)
-                    I->act[(static_cast<size_t>(e) * I->T + ts[k]) * I->F + r] = gv[k] / (1.f + std::exp(-gv[k])) * uv[k];
+                    I->act[(static_cast<size_t>(e) * I->T + ts[k]) * I->F + r] = I->swiglu(gv[k], uv[k]);
             }
             return;
         }
@@ -160,7 +167,7 @@ struct CpuExperts::Impl {
                 float gv, uv;
                 I->tr_gu->vec_dot(I->D, &gv, 0, g + r * I->gu_rb, 0, xq, 0, 1);
                 I->tr_gu->vec_dot(I->D, &uv, 0, u + r * I->gu_rb, 0, xq, 0, 1);
-                I->act[(static_cast<size_t>(e) * I->T + t) * I->F + r] = gv / (1.f + std::exp(-gv)) * uv;
+                I->act[(static_cast<size_t>(e) * I->T + t) * I->F + r] = I->swiglu(gv, uv);
             }
     }
     static void quant_act_task(Impl * I, int task) {   // task = job * T + token
@@ -173,7 +180,7 @@ struct CpuExperts::Impl {
     }
     static void down_task(Impl * I, int task) {
         const int per = I->D / kDownRows, e = task / per, r0 = (task % per) * kDownRows;
-        const uint8_t * d = I->jobs[e].base + 2 * I->gu_bytes;
+        const uint8_t * d = I->jobs[e].down ? I->jobs[e].down : I->jobs[e].base + 2 * I->gu_bytes;
         const int mask = I->jobs[e].mask;
         for (int t = 0; t < I->T; ++t) {
             if (!((mask >> t) & 1)) continue;
@@ -203,9 +210,10 @@ const char * CpuExperts::type_name(uint32_t type) {
 }
 
 void CpuExperts::run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, int D, const float * x, int T, const Job * jobs,
-                     int n) {
+                     int n, float swiglu_limit, const std::function<void()> & before_down) {
     if (n == 0) return;
     Impl & I = *p_;
+    I.limit = swiglu_limit;
     const auto tg = static_cast<ggml_type>(type_gu), td = static_cast<ggml_type>(type_d);
     I.tr_gu = ggml_get_type_traits_cpu(tg);
     I.tr_d  = ggml_get_type_traits_cpu(td);
@@ -242,6 +250,7 @@ void CpuExperts::run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, 
     I.cur_ph = 2;
     I.phase(n * T, &Impl::quant_act_task);
     const auto t3 = clk::now();
+    if (before_down) before_down();
     I.cur_ph = 3;
     I.phase(n * (D / Impl::kDownRows), &Impl::down_task);
     I.cur_ph = 0;

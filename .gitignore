@@ -9,3 +9,4 @@ logs/
 __pycache__/
 agent/brain/
 agent/best/
+data/dsv41/

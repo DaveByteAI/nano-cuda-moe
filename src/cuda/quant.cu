@@ -48,12 +48,17 @@ constexpr int kRowsPerBlock = 4;   // warps per thread block
 template <int T>
 __global__ void matvec_k(const uint8_t * __restrict__ W, size_t row_bytes, int M, int K, const float * __restrict__ x,
                          float * __restrict__ y) {
+    // block diagonal (matvec_blocks): group blockIdx.y has its own M rows, K inputs and M outputs
+    W += static_cast<size_t>(blockIdx.y) * M * row_bytes;
+    x += static_cast<size_t>(blockIdx.y) * K;
+    y += static_cast<size_t>(blockIdx.y) * M;
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.x * kRowsPerBlock + (threadIdx.x >> 5);
     if (r >= M) return;
     const uint8_t * row = W + static_cast<size_t>(r) * row_bytes;
     const int n_groups = K / 8;
     float acc = 0.f;
+#pragma unroll 4
     for (int gg = lane; gg < n_groups; gg += 32) {
         const int blk = gg / Grp<T>::groups, g = gg % Grp<T>::groups;
         float v[8];
@@ -111,8 +116,8 @@ template <int T> struct DequantRowsBf16 {
 };
 
 template <int T> struct Matvec {
-    static void run(const void * W, size_t rb, int M, int K, const float * x, float * y, cudaStream_t s) {
-        matvec_k<T><<<(M + kRowsPerBlock - 1) / kRowsPerBlock, 32 * kRowsPerBlock, 0, s>>>(
+    static void run(const void * W, size_t rb, int M, int K, const float * x, float * y, cudaStream_t s, int G) {
+        matvec_k<T><<<dim3((M + kRowsPerBlock - 1) / kRowsPerBlock, G), 32 * kRowsPerBlock, 0, s>>>(
             static_cast<const uint8_t *>(W), rb, M, K, x, y);
     }
 };
@@ -146,7 +151,12 @@ void dequant_rows_bf16(uint32_t t, const void * W, size_t rb, int M, int K, void
 
 void matvec(uint32_t t, const void * W, size_t rb, int M, int K, const float * x, float * y, cudaStream_t s) {
     check_k(t, K);
-    dispatch<Matvec>(t, W, rb, M, K, x, y, s);
+    dispatch<Matvec>(t, W, rb, M, K, x, y, s, 1);
+}
+
+void matvec_blocks(uint32_t t, const void * W, size_t rb, int M, int K, int G, const float * x, float * y, cudaStream_t s) {
+    check_k(t, K);
+    dispatch<Matvec>(t, W, rb, M, K, x, y, s, G);
 }
 
 }  // namespace bl::cuda

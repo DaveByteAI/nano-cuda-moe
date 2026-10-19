@@ -1,7 +1,12 @@
 #include "bl/text.h"
 
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
+#include "gguf.h"
 #include "llama.h"
 
 namespace bl {
@@ -11,12 +16,50 @@ struct Text::Impl {
     const llama_vocab * vocab = nullptr;
 };
 
+namespace {
+
+// a model whose architecture this libllama does not know (deepseek41) still has a tokenizer it knows (the vocab, the
+// merges, a pre-tokenizer such as joyai-llm): its metadata, tensors left out, copied to a temporary file under an
+// architecture name libllama accepts. A vocab-only load reads nothing architecture-specific. "" if not applicable.
+std::string vocab_copy(const std::string & path) {
+    gguf_init_params ip{true, nullptr};
+    gguf_context * src = gguf_init_from_file(path.c_str(), ip);
+    if (!src) return "";
+    std::string out;
+    const int64_t k = gguf_find_key(src, "general.architecture");
+    if (k >= 0 && gguf_find_key(src, "tokenizer.ggml.model") >= 0) {
+        gguf_context * dst = gguf_init_empty();
+        gguf_set_kv(dst, src);
+        gguf_set_val_str(dst, "general.architecture", "deepseek2");
+        for (const char * key : {"split.no", "split.count", "split.tensors.count"}) gguf_remove_key(dst, key);   // one file
+        char tmpl[] = "/tmp/bl-vocab-XXXXXX";
+        const int fd = mkstemp(tmpl);
+        if (fd >= 0) {
+            ::close(fd);
+            if (gguf_write_to_file(dst, tmpl, true)) out = tmpl;
+            else std::remove(tmpl);
+        }
+        gguf_free(dst);
+    }
+    gguf_free(src);
+    return out;
+}
+
+}  // namespace
+
 Text::Text(const std::string & path) : p_(std::make_unique<Impl>()) {
     llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);   // quiet
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     mp.n_gpu_layers = 0;
     p_->model = llama_model_load_from_file(path.c_str(), mp);
+    if (!p_->model) {   // an architecture unknown here: its tokenizer through a vocab-only copy
+        const std::string tmp = vocab_copy(path);
+        if (!tmp.empty()) {
+            p_->model = llama_model_load_from_file(tmp.c_str(), mp);
+            std::remove(tmp.c_str());
+        }
+    }
     if (!p_->model) throw std::runtime_error("cannot load the tokenizer from " + path);
     p_->vocab = llama_model_get_vocab(p_->model);
 }

@@ -27,7 +27,7 @@ int main(int argc, char ** argv) {
 
     // one layer per (gate/up format, down format) pair
     std::map<std::pair<uint32_t, uint32_t>, int> pick;
-    for (int il = 0; il < 48; ++il) {
+    for (int il = 0; g.find("blk." + std::to_string(il) + ".ffn_gate_exps.weight"); ++il) {   // every layer with routed experts
         const auto & gt = g.at("blk." + std::to_string(il) + ".ffn_gate_exps.weight");
         const auto & dt = g.at("blk." + std::to_string(il) + ".ffn_down_exps.weight");
         pick.emplace(std::make_pair(gt.type_id, dt.type_id), il);

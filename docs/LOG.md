@@ -677,3 +677,90 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 - 已排除：AddressSanitizer 版本（主机代码全部插桩）完整跑通、没有报告；GPU 到主机的异步拷贝全部写锁页内存。
   还没查：GPU 核函数通过映射指针写主机内存时的越界、CPU 专家线程之间的竞争。
 - 考官遇到这种崩溃会重试一次，报告里记 `retried`。
+
+## 2026-10-18 dsv41 分支：DeepSeek-V4.1-Flash-1017（阶段 A，正确性优先）
+
+- 模型：acrogenesis 的 IQ2_XXS 专家 / Q8_0 稠密 / Q8_0 Engram 的 GGUF，revision `f5221b0`，10 个文件 359 GB
+  （`scripts/download_dsv41.sh`）。规格与公式全部写在 [DSV41.md](DSV41.md)，依据是官方 `inference/model.py`、`kernel.py`、
+  `engram.py`，与 llama.cpp PR #28696 逐条核对过。
+- 下载：两个代理都连不上（SSL 失败）。最快的办法是 hf-mirror 只请求一次 302 拿到 HF CDN 的签名地址，再对 CDN 开 16 个连接：
+  34–40 MiB/s；单连接约 6 MiB/s；对镜像本身开 16 个连接会被 429。镜像的 302 偶尔也回 429，脚本退避重试，不把镜像地址交给 aria2。
+- 参考实现：GitHub 直连约 25 KB/s，`git fetch` 反复卡死；通过 ghfast.top 取 PR commit `2076412` 的源码包（8 s），
+  tar 头的 commit id 一致，5 个关键文件与独立来源逐字节相同。CPU 版编出 `bl-ref-dump-dsv41`。
+- 校验：GGUF 里 Engram 的素数、偏移、乘数与 `engram.py` 的构造方法重算结果完全相同；`tests/test_dsv41_ops` 每个 kernel
+  对照参考公式的 CPU 实现，误差都在 fp32 舍入范围内（相对 1e-7 量级）。
+- 结构上值得记的点：RoPE 只转最后 64 维、相邻配对（llama.cpp `LLAMA_ROPE_TYPE_NORM`，转换时不重排权重）；YaRN 不乘
+  mscale；hc 系数滞后一个子层；只有 1 个 KV 头且 K = V；压缩 KV 与 indexer 只在源层计算、后面的层共用。
+- 字节预算：路由专家 140.14 GB（每 token 读 2.19 GB）、稠密加 output 8.94 GB（每 token 全读，840 GB/s 下约 10.6 ms 的下限）、
+  Engram 表 208.90 GB（每 token 48 行，几乎每行一个 4 KB 页）。
+
+## 2026-10-19 dsv41：带 Engram 的解码优化（混合解码，`BL_DSV41_HYBRID=1`）
+
+- 测量方法：`bl-dsv41 --force 64` 先 prefill 64 个 token，再逐 token 喂真实文本（teacher-forced，每次运行工作量相同），
+  `bench/dsv41/real_{zh,cuda,en}.tokens` 各 512 token，统计第 128 步之后的 320 步。原来的 `code.tokens` 生成会重复（不带 Engram
+  时陷进死循环），专家复用率虚高，不再用来比速度。prefill 的 logits 每次运行有 ±0.2 的差（原子加），自由生成长了会分岔。
+- `BL_DSV41_TRACE` 记录每步每层的专家选择，`tools/dsv41_cache_sim.py` 离线重放缓存策略（与实测的 VRAM 未命中数吻合）。
+
+| 改动 | zh ms/token | 依据 |
+|---|---|---|
+| 起点（Engram 打开） | 203 | 每 token 读盘 16.7 次、每次约 8 ms |
+| IO 线程 4 → 1 | 176 | 这块 NVMe 并发多了反而慢（3 MB 块：1 线程 1.6 GB/s，4 线程 1.3） |
+| VRAM / RAM 两层互斥（进 VRAM 就移出 RAM，淘汰时拷回） | 150 | 模拟器读盘 −28%，实测 −39% |
+| 早拷入：一层 ≥2 个未命中时 1 个拷进 VRAM 由 GPU 算 + 预留空闲槽 | 141 | 这次拷贝本来就要做 |
+| 2 个 IO 线程、读拆成 1.5 MB | 137 | `tests/bench_dsv41_ram.cpp`：一个专家 3 段分给 2 线程时尾段只有 1 路 |
+| 层内流水：先算已在内存的未命中，同时等盘 | 132 | `ExpertRam::start/wait` |
+| hc_fn 每行一个 block 并顺带求平方和、wo_a 一次发射 | 129 | hc 部分每步 3.1 → 1.1 ms |
+| 小拷贝改用 kernel 读写锁页内存（不走拷贝引擎） | 116 | 路由结果、plan、CPU 输出排在 9 MB 专家拷贝后面，每层约 0.38 ms |
+| 预读第 il+2 层路由的 top-2；共享专家与 CPU 专家并行 | 112 | |
+| split-K 注意力（8 个头共用一次 key 读取） | 112.7 | 路由前 GPU 等待 14.9 → 12.5 ms（总时间被读盘波动盖住） |
+| logits 与 step 开头的上传走锁页缓冲 | 110 | |
+| q_a+kv、共享专家 gate+up 各合成一次发射（同一块分配，不复制） | 109.9 | 显存碎片少了，缓存多 13 个槽 |
+| 准入过滤：一个专家在最近 1000 次未命中里第二次出现才进 VRAM | 106.3 | 每次拷入 = 9 MB 上 + 9 MB 回，占 PCIe 和内存带宽；回拷减半 |
+| matvec 循环 `#pragma unroll 4`（共用 kernel，Qwen3.8 logits 逐字节不变） | 107 | wo_b 70 → 58 us |
+| 从盘读的专家：gate/up 两段到了就先算，down 到了再算 | 107 | 等盘 49.8 → 48.2 ms |
+| 自己的单行 rmsnorm（1024 线程）、q_a/kv 两个 norm 一次发射；路由阶段 4 个小拷贝一次发射；Sinkhorn 并进 hc_fn 的最后一个 block；注意力 16 个 key 一块 | **104.8** | 路由前等待 12.1 → 10.0 ms |
+
+- 三段文本：zh 203 → 105、cuda 158 → 89、en 222 → 113 ms/token（8.8–11.2 tok/s）。
+- CPU 专家：IQ2_XXS 在 K = 5120 上每线程 3.1 GB/s，冷热数据一样，线程数线性（`tests/bench_dsv41_cpu.cpp`），是解码算力的
+  上限，不是内存；gather 取码本没有变化。`bench_cpu` 的尺寸是 Qwen 的，对这个模型的数字不能用。
+- 没用的：直接 O_DIRECT 读进槽位（去掉中转 memcpy，中转缓冲本来就在 L3）；把一部分未命中经临时槽交给 GPU
+  （按 0.77 / 0.49 ms 的代价平衡也一样：拷贝串行，GPU 端等待抵掉 CPU 的节省）；x 放 shared memory 的 matvec（更慢）；
+  LFU / SLRU / ARC / LRU-2 都不如 LRU（模拟）；RAM 层也加准入过滤（模拟：读盘 12.9 → 14.6–19.5 次/步）；预读 top-16 把盘塞满（257 ms）；CPU 线程 8/12/16 无差别（IQ2_XXS
+  解码算力受限，利用率 96%）；3 个 IO 线程；自适应早拷入个数；`BL_CPU_SPINS`。
+- 事故：`BL_DSV41_RAM_GB=56` 的锁页池把内存用尽，机器死机重启。现在池子最多 MemAvailable − 8 GB；默认留 12 GB
+  （运行中 MemAvailable 最低 11.4 GB）。
+- 现在的构成（zh）：等盘约 51 ms、CPU 算未命中约 30 ms、路由前 GPU 约 13 ms、GPU 收尾约 9 ms。
+
+## 2026-10-19 dsv41：prefill
+
+- prefill 卡在读盘：64 token 一块时，每块每层用到约 250 个专家，40 层约 1 万个，超过 VRAM + RAM（约 7400），下一块又要重读。
+  `BL_DSV41_CHUNK`：64 → 5.9 tok/s，512 → 9.1，1024 → 13.7（1024 token 的提示词）。
+- 长提示词一块跑完（上限 `BL_DSV41_PREFILL_MAX` = 4096）：专家缓存分成 64 槽一段，prefill 时借出末尾的段（里面的专家先拷回 RAM），
+  缓冲区放得下为止，完了再还回来。512 token 86 → 53 s，1023 token 约 173 → 69 s（14.8 tok/s）。check-prefill（512 个位置）：
+  KL 0.0065、top-1 497/512（64 一块：0.0075、486/512）。
+- 长 prefill 期间 RAM 层冻结：会挤掉常驻专家的读放进 3 层的临时槽。一块之内没有复用，读盘不变；紧接着的解码前 223 步
+  150.7 vs 176.4 ms/token；超过 4096 token 的多块提示词跨块复用。
+- 没用的：读下一层的全部专家（不冻结时挤掉后面要用的，冻结时也多读 28%：1023 个 token 也只用到每层约 3/4 的专家）。
+- 输出头 BF16 → Q8_0（加载时转换，KL 2e-5）、显存预留 1.5 → 0.5 GB：专家缓存 1542 → 1728 槽；解码 zh/cuda/en 101/86/104 ms/token。
+
+## 2026-10-19 dsv41：DSpark（官方的 MTP）测了接受率，结论是这台机器上不做
+
+- 这个 GGUF 没有 DSpark 的 3 层；官方权重里在 `mtp.0-2`（分片 44-46，7.9 GB）。`bl-dspark-pack` 打成 GGUF：注意力等 FP8 → Q8_0，
+  专家 MXFP4 → IQ4_XS（相对 MXFP4 的 RMS 误差 7.6%），路由器和 Markov 头保留 BF16，共 7.97 GB，其中专家 7.2 GB。
+- 结构（官方 `model.py` DSparkBlock / forward_spec）：主模型第 37–39 层注意力输入的 4 路均值拼成 15360 维 → `main_proj` →
+  `main_norm`；每层的窗口里只存主模型各位置的 KV；草稿块是 `[刚出的 token, noise×4]`，块内双向注意力；
+  输出头和主模型共用，另加 Markov 偏置（依赖上一个草稿 token，所以 5 个草稿依次取）。
+- 接受率：`tools/dspark_ref.py`（numpy，直接读官方 FP8/MXFP4 权重，无重量化）在主模型（IQ2_XXS）的贪心生成轨迹上
+  （`bl-dsv41 --gen 256 --dump --filter 'l_last-(36|37|38)'`，提示词是三段测试文本的前 128 个 token）：
+
+| 文本 | 平均接受（满分 5） | 每次验证产出 |
+|---|---|---|
+| zh | 3.06 | 4.06 |
+| en | 2.32 | 3.32 |
+| cuda | 4.35 | 5.35（生成内容重复） |
+
+  逐位置接受率 86 / 74 / 65 / 54 / 45%。贪心轨迹偏重复，数字偏乐观。
+- 但验证不便宜：`bl-dsv41 --force 64 --chunk 6`（6 个 token 一次走 prefill）861 ms 一块，单步 101 ms，即 8.5 步。
+  专家轨迹：连续 6 个 token 每层用到 21.4 个不同专家（单个 6 个），而 CPU 算未命中按（token，专家）计、读盘按不同专家计。
+  就算写一条理想的小批量混合验证路径，上限也只有约 1.1–1.2 倍，再减去草稿自己 7.2 GB 专家占掉的 VRAM / RAM 缓存。
+- 结论：卸载场景下投机解码赚不到；模型整个放得进显存（多卡、96 GB 的卡）时才值得做。打包工具和参考实现留着。

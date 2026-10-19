@@ -139,7 +139,7 @@ __global__ void quantize_q8_k(const float * x, int nblocks, BlockQ8 * out) {
 constexpr int kGuLanes = 16, kGuRowsPerWarp = 32 / kGuLanes;
 template <int F>
 __global__ void plan_gate_up_k(const ExpertPlan * plan, int kinds, int T, size_t gu_bytes, int Fd, int D,
-                               const BlockQ8 * __restrict__ xq, float * act) {
+                               const BlockQ8 * __restrict__ xq, float * act, float limit) {
     const int e = blockIdx.y, lane = threadIdx.x & 31, sub = lane % kGuLanes;
     const int r = (blockIdx.x * kExpWarps + (threadIdx.x >> 5)) * kGuRowsPerWarp + lane / kGuLanes;
     if (e >= plan->n_slots || !((kinds >> plan->kind[e]) & 1) || r >= Fd) return;   // whole warps (Fd is even)
@@ -160,6 +160,7 @@ __global__ void plan_gate_up_k(const ExpertPlan * plan, int kinds, int T, size_t
             gt += __shfl_xor_sync(0xffffffffu, gt, o);
             ut += __shfl_xor_sync(0xffffffffu, ut, o);
         }
+        if (limit > 0.f) { gt = fminf(gt, limit); ut = fminf(fmaxf(ut, -limit), limit); }   // DeepSeek-V4's clamps
         if (sub == 0 && ((mask >> t) & 1)) act[(static_cast<size_t>(e) * kMaxT + t) * Fd + r] = gt / (1.f + expf(-gt)) * ut;
     }
 }
@@ -241,10 +242,11 @@ void dispatch(uint32_t t, A... a) {
 }
 
 template <int F> struct GateUp {
-    static void run(const ExpertPlan * p, int kinds, int T, size_t gu, int Fd, int D, const void * xq, float * act, cudaStream_t s) {
+    static void run(const ExpertPlan * p, int kinds, int T, size_t gu, int Fd, int D, const void * xq, float * act, cudaStream_t s,
+                    float limit) {
         constexpr int rpb = kExpWarps * kGuRowsPerWarp;
         plan_gate_up_k<F><<<dim3((Fd + rpb - 1) / rpb, kMaxSlots), 32 * kExpWarps, 0, s>>>(
-            p, kinds, T, gu, Fd, D, static_cast<const BlockQ8 *>(xq), act);   // (grid below: rows per block)
+            p, kinds, T, gu, Fd, D, static_cast<const BlockQ8 *>(xq), act, limit);   // (grid below: rows per block)
     }
 };
 template <int F> struct Down {
@@ -301,8 +303,8 @@ void quantize_q8(const float * x, int n, void * out, cudaStream_t s, int T) {
 }
 
 void plan_gate_up(uint32_t t, const ExpertPlan * p, int kinds, int T, size_t gu, int F, int D, const void * xq, float * act,
-                  cudaStream_t s) {
-    dispatch<GateUp>(t, p, kinds, T, gu, F, D, xq, act, s);
+                  cudaStream_t s, float limit) {
+    dispatch<GateUp>(t, p, kinds, T, gu, F, D, xq, act, s, limit);
 }
 
 void plan_down(uint32_t td, const ExpertPlan * p, int kinds, int T, size_t gu, int F, int D, const float * act, float * out,
