@@ -101,11 +101,12 @@ struct ExpertRam::Io {
         std::lock_guard<std::mutex> lk(mu);
         return inflight[slot] != 0;
     }
-    // blocks until no read of these slots is queued or running; their queued prefetches move to the demand queue
-    void wait(const std::vector<int> & slots) {
-        std::unique_lock<std::mutex> lk(mu);
+    // blocks until no read of these slots is queued or running
+    void promote(const int * slots, int n) {
+        std::lock_guard<std::mutex> lk(mu);
         bool moved = false;
-        for (int s : slots) {
+        for (int i = 0; i < n; ++i) {
+            const int s = slots[i];
             if (!inflight[s]) continue;
             for (auto it = background.begin(); it != background.end();) {
                 if (it->slot == s) { demand.push_front(*it); it = background.erase(it); moved = true; }
@@ -113,6 +114,9 @@ struct ExpertRam::Io {
             }
         }
         if (moved) cv.notify_all();
+    }
+    void wait(const std::vector<int> & slots) {
+        std::unique_lock<std::mutex> lk(mu);
         done_cv.wait(lk, [&] {
             for (int s : slots) if (inflight[s]) return false;
             return true;
@@ -152,6 +156,10 @@ ExpertRam::ExpertRam(size_t bytes, size_t per, int io_threads, bool pin) : per_(
     pf_.assign(n_, 0);
     hold_.assign(n_, nullptr);
     for (int i = 0; i < n_; ++i) lru_.push_back(i);
+    // BL_DSV41_IO_CHUNK_KB: split each part's read (default 1536: two threads stay busy to the end of one expert;
+    // tests/bench_dsv41_ram.cpp)
+    chunk_bytes_ = size_t{1536} * 1024;
+    if (const char * e = std::getenv("BL_DSV41_IO_CHUNK_KB")) chunk_bytes_ = static_cast<size_t>(std::atol(e)) * 1024;
     io_ = std::make_unique<Io>(std::max(io_threads, 1), per, n_);
 }
 
@@ -161,6 +169,12 @@ ExpertRam::~ExpertRam() {
         for (size_t o = 0; o < pool_bytes_pinned_; o += chunk_) cudaHostUnregister(pool_ + o);
         ::munmap(pool_, pool_bytes_);
     }
+}
+
+// one part as reads of at most chunk_bytes_ each (so two threads stay busy to the end of one expert)
+template <typename V> void ExpertRam::add_tasks(V & tasks, int fd, uint64_t off, size_t len, uint8_t * dst, int slot) {
+    const size_t ch = chunk_bytes_ ? chunk_bytes_ : len;
+    for (size_t o = 0; o < len; o += ch) tasks.push_back({fd, off + o, std::min(ch, len - o), dst + o, slot});
 }
 
 bool ExpertRam::held(int slot) {
@@ -187,9 +201,27 @@ int ExpertRam::victim() {
 }
 
 void ExpertRam::fetch(const int * keys, const Src * src, int n_keys, const uint8_t ** out) {
+    std::vector<int> slots(n_keys);
+    std::vector<char> ready(n_keys);
+    start(keys, src, n_keys, out, slots.data(), ready.data());
+    wait(slots.data(), n_keys);
+}
+
+void ExpertRam::wait(const int * slot, int n) {
+    std::vector<int> slots(slot, slot + n);
+    for (int s : slots)
+        if (hold_[s]) {   // filled by a device copy still running
+            if (cudaEventSynchronize(hold_[s]) != cudaSuccess) throw std::runtime_error("RAM tier copy failed");
+            hold_[s] = nullptr;
+        }
+    const auto t0 = std::chrono::steady_clock::now();
+    io_->wait(slots);
+    read_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertRam::start(const int * keys, const Src * src, int n_keys, const uint8_t ** out, int * slots, char * ready) {
     if (n_keys > n_) throw std::runtime_error("RAM tier: more experts at once than slots");
     std::vector<Io::Task> tasks;
-    std::vector<int> slots(n_keys);
     for (int i = 0; i < n_keys; ++i) {
         auto it = where_.find(keys[i]);
         if (it != where_.end()) {
@@ -197,10 +229,7 @@ void ExpertRam::fetch(const int * keys, const Src * src, int n_keys, const uint8
             const int slot = *it->second;
             lru_.splice(lru_.begin(), lru_, it->second);
             if (pf_[slot]) { ++prefetch_used; pf_[slot] = 0; prefetch_waits += io_->busy(slot); }
-            if (hold_[slot]) {   // filled by a device copy still running
-                if (cudaEventSynchronize(hold_[slot]) != cudaSuccess) throw std::runtime_error("RAM tier copy failed");
-                hold_[slot] = nullptr;
-            }
+            ready[i] = !io_->busy(slot) && !held(slot);
             slots[i] = slot;
             out[i] = pool_ + static_cast<size_t>(slot) * per_;
             continue;
@@ -212,18 +241,18 @@ void ExpertRam::fetch(const int * keys, const Src * src, int n_keys, const uint8
         where_[keys[i]] = lru_.begin();
         uint8_t * dst = pool_ + static_cast<size_t>(slot) * per_;
         slots[i] = slot;
+        ready[i] = 0;
         out[i] = dst;
         size_t o = 0;
         for (int k = 0; k < 3; ++k) {
-            tasks.push_back({src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot});
+            add_tasks(tasks, src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot);
             o += src[i].len[k];
         }
         ++reads;
     }
-    const auto t0 = std::chrono::steady_clock::now();
     io_->enqueue(tasks, false);
-    io_->wait(slots);
-    read_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // queued prefetches of these keys move ahead of the other background reads
+    io_->promote(slots, n_keys);
 }
 
 void ExpertRam::prefetch(const int * keys, const Src * src, int n_keys) {
@@ -238,7 +267,7 @@ void ExpertRam::prefetch(const int * keys, const Src * src, int n_keys) {
         uint8_t * dst = pool_ + static_cast<size_t>(slot) * per_;
         size_t o = 0;
         for (int k = 0; k < 3; ++k) {
-            tasks.push_back({src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot});
+            add_tasks(tasks, src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot);
             o += src[i].len[k];
         }
         ++prefetched;

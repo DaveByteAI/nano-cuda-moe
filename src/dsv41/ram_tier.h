@@ -39,6 +39,10 @@ public:
     // makes every key resident, reading the missing ones from disk in parallel; out[i] = its slot. Keys of one call
     // never evict each other (n_keys <= slots). Blocks until all reads are done, prefetches of these keys included.
     void fetch(const int * keys, const Src * src, int n_keys, const uint8_t ** out);
+    // fetch in two halves: start() queues the reads and returns; ready[i]: key i is usable now (resident, no read
+    // or copy in flight); slots[i] is what wait() takes. The out pointers stay valid until the next start/fetch/prefetch.
+    void start(const int * keys, const Src * src, int n_keys, const uint8_t ** out, int * slots, char * ready);
+    void wait(const int * slots, int n);
     // starts reading the keys that are not resident, behind any demanded reads; returns at once
     void prefetch(const int * keys, const Src * src, int n_keys);
 
@@ -58,8 +62,9 @@ private:
     struct Io;
     int victim();   // the least recently used slot with no reads or copies in flight, taken off the LRU
     bool held(int slot);   // a device copy of the slot still running
+    template <typename V> void add_tasks(V & tasks, int fd, uint64_t off, size_t len, uint8_t * dst, int slot);
     uint8_t * pool_ = nullptr;
-    size_t    pool_bytes_ = 0, pool_bytes_pinned_ = 0, per_ = 0, chunk_ = 1;
+    size_t    pool_bytes_ = 0, pool_bytes_pinned_ = 0, per_ = 0, chunk_ = 1, chunk_bytes_ = 0;
     int       n_ = 0;
     bool      pinned_ = false;
     std::vector<int>  key_;   // per slot, -1 free

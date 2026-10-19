@@ -89,7 +89,7 @@ struct Dsv41Engine::Impl {
         int      fd[3] = {-1, -1, -1};                                     // O_DIRECT descriptors of their shards
         uint64_t off[3] = {};                                               // file offsets of expert 0's part
     };
-    // RAM tier (src/dsv41/ram_tier.h): BL_DSV41_RAM_GB (default: MemAvailable - 12 GB), BL_DSV41_IO_THREADS (1: this NVMe reads fastest with ~6 MB in flight; more streams drop it to 1.3 GB/s)
+    // RAM tier (src/dsv41/ram_tier.h): BL_DSV41_RAM_GB (default: MemAvailable - 12 GB), BL_DSV41_IO_THREADS (2, with the reads cut into 1.5 MB pieces: this NVMe reads fastest with 3-6 MB in flight)
     std::unique_ptr<ExpertRam> ram;
     std::vector<int> direct_fd;   // per opened shard
     std::vector<LayerExperts> experts;
@@ -478,7 +478,7 @@ struct Dsv41Engine::Impl {
                 std::fprintf(stderr, "dsv41: RAM tier capped at %.1f GB (MemAvailable - 8 GB)\n", cap / 1e9);
                 want = cap;
             }
-            const int iot = std::getenv("BL_DSV41_IO_THREADS") ? std::atoi(std::getenv("BL_DSV41_IO_THREADS")) : 1;
+            const int iot = std::getenv("BL_DSV41_IO_THREADS") ? std::atoi(std::getenv("BL_DSV41_IO_THREADS")) : 2;
             want = std::max(want, per * static_cast<size_t>(c.n_expert));   // at least one layer's worth
             ram = std::make_unique<ExpertRam>(want, per, iot, true);
             std::fprintf(stderr, "dsv41: RAM tier %d slots (%.1f GB, %.1f%% of all experts)%s\n", ram->slots(), ram->bytes() / 1e9,
@@ -868,12 +868,28 @@ struct Dsv41Engine::Impl {
         }
         const int n = static_cast<int>(ck_.size());
         std::vector<const uint8_t *> slot(n);
+        std::vector<int> rslot(n);
+        int nready = n;
         const auto t0 = std::chrono::steady_clock::now();
-        if (n) {   // the misses from the RAM tier; the ones not there are read from disk, all at once
-            std::vector<int> ev(n);
-            for (int j = 0; j < n; ++j) ev[j] = hid[ck_[j]];
-            ram_get(il, ev.data(), n, slot.data());
-            t_ram += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (n) {   // the misses from the RAM tier; the ones not there start reading from disk, all at once
+            std::vector<int> keys(n);
+            std::vector<ExpertRam::Src> src(n);
+            for (int j = 0; j < n; ++j) { keys[j] = il * c.n_expert + hid[ck_[j]]; src[j] = src_of(il, hid[ck_[j]]); }
+            if (admit_pending && !exclusive) {   // an admission copy may still read a RAM slot this fetch could evict
+                ck(cudaEventSynchronize(ev_admit), "admission");
+                admit_pending = false;
+            }
+            std::vector<char> ready(n);
+            ram->start(keys.data(), src.data(), n, slot.data(), rslot.data(), ready.data());
+            // the usable ones first: they are computed while the disk reads run
+            std::vector<int> ord(n);
+            std::iota(ord.begin(), ord.end(), 0);
+            std::stable_partition(ord.begin(), ord.end(), [&](int j) { return ready[j] != 0; });
+            nready = static_cast<int>(std::count(ready.begin(), ready.end(), 1));
+            std::vector<int> ck2(n), rs2(n);
+            std::vector<const uint8_t *> sl2(n);
+            for (int j = 0; j < n; ++j) { ck2[j] = ck_[ord[j]]; rs2[j] = rslot[ord[j]]; sl2[j] = slot[ord[j]]; }
+            ck_.swap(ck2); rslot.swap(rs2); slot.swap(sl2);
         }
         // the next layer's likely experts that are in neither tier: read in the background while this layer computes
         // (after this layer's fetch, so its slots are at the LRU front and no prefetch evicts them)
@@ -896,7 +912,7 @@ struct Dsv41Engine::Impl {
             }
         }
         // the first ng misses: admitted now and computed on the GPU once their copy lands, while the CPU does the rest
-        const int ng = n >= 2 && exclusive ? std::min({early, n - 1, static_cast<int>(free_vslots.size())}) : 0;
+        const int ng = n >= 2 && exclusive ? std::min({early, n - 1, nready, static_cast<int>(free_vslots.size())}) : 0;
         if (ng > 0) {
             const auto ta = std::chrono::steady_clock::now();
             std::memset(plan2_h, 0, sizeof *plan2_h);
@@ -924,7 +940,15 @@ struct Dsv41Engine::Impl {
             ck(cudaMemcpy(x_h, x, D * 4, cudaMemcpyDeviceToHost), "x");
             std::vector<CpuExperts::Job> jobs(nc);
             for (int j = 0; j < nc; ++j) jobs[j] = {slot[ng + j], 1, cpu_out_h + static_cast<size_t>(j) * D};
-            cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), nc, lim);
+            // the resident ones while the disk reads run, then the rest once they land
+            const int n1 = std::max(nready - ng, 0);
+            cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), n1, lim);
+            if (n1 < nc) {
+                const auto tw = std::chrono::steady_clock::now();
+                ram->wait(rslot.data() + ng + n1, nc - n1);
+                t_ram += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+                cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data() + n1, nc - n1, lim);
+            }
             cpu_experts += nc;
             t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             ck(cudaMemcpyAsync(cpu_out_d, cpu_out_h, sizeof(float) * nc * D, cudaMemcpyHostToDevice, st), "cpu out");
