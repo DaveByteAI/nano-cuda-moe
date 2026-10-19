@@ -155,6 +155,9 @@ struct Dsv41Engine::Impl {
     // BL_DSV41_PREFETCH=K (hybrid decode, default 0 = off): that prediction's top K are read into the RAM tier in the
     // background while this layer computes
     int prefetch_k = std::getenv("BL_DSV41_PREFETCH") ? std::atoi(std::getenv("BL_DSV41_PREFETCH")) : 0;
+    // BL_DSV41_PREFETCH_DIST=d (default 1): the prediction is for layer il + d (a read takes ~6 ms, a layer ~3.5);
+    // the measurements (BL_DSV41_PRED, BL_DSV41_TRACE) assume 1
+    int prefetch_dist = std::getenv("BL_DSV41_PREFETCH_DIST") ? std::atoi(std::getenv("BL_DSV41_PREFETCH_DIST")) : 1;
     // BL_DSV41_TRACE=FILE (measurement): per decode step and layer "pos layer: 6 picks | next layer's top 24" (cache
     // policy simulations: tools/dsv41_cache_sim.py)
     FILE * trace = std::getenv("BL_DSV41_TRACE") ? std::fopen(std::getenv("BL_DSV41_TRACE"), "w") : nullptr;
@@ -454,6 +457,12 @@ struct Dsv41Engine::Impl {
             // 12 GB left: the system, the Engram rows' pages, and any file I/O (a download) in the page cache
             size_t want = avail > (size_t{12} << 30) ? avail - (size_t{12} << 30) : 0;
             if (const char * e = std::getenv("BL_DSV41_RAM_GB")) want = static_cast<size_t>(std::atof(e) * (1ull << 30));
+            // the pool is pinned (never swapped): asking for more than MemAvailable - 8 GB hung this box once
+            const size_t cap = avail > (size_t{8} << 30) ? avail - (size_t{8} << 30) : 0;
+            if (want > cap) {
+                std::fprintf(stderr, "dsv41: RAM tier capped at %.1f GB (MemAvailable - 8 GB)\n", cap / 1e9);
+                want = cap;
+            }
             const int iot = std::getenv("BL_DSV41_IO_THREADS") ? std::atoi(std::getenv("BL_DSV41_IO_THREADS")) : 1;
             want = std::max(want, per * static_cast<size_t>(c.n_expert));   // at least one layer's worth
             ram = std::make_unique<ExpertRam>(want, per, iot, true);
@@ -689,8 +698,9 @@ struct Dsv41Engine::Impl {
         // the next layer's router on this layer's FFN input: the experts it will likely pick (one sync with this one's)
         std::vector<int> next_pred;
         const int nk = std::min(std::max({pred_stats ? pred_k : 0, hybrid ? prefetch_k : 0, trace ? 24 : 0}), 64);
-        if (nk > 0 && il + 1 < c.n_layer) {
-            const std::string pn = "blk." + std::to_string(il + 1) + ".";
+        const int pl = il + (hybrid && prefetch_k > 0 ? prefetch_dist : 1);
+        if (nk > 0 && pl < c.n_layer) {
+            const std::string pn = "blk." + std::to_string(pl) + ".";
             mv(pn + "ffn_gate_inp.weight", x, pred_logit);
             cuda::dsv41::router_topk(pred_logit, V(pn + "exp_probs_b.bias"), c.n_expert, nk, 1.f, pred_ids_d, pred_w_d, st);
             next_pred.resize(nk);
@@ -809,14 +819,15 @@ struct Dsv41Engine::Impl {
         }
         // the next layer's likely experts that are in neither tier: read in the background while this layer computes
         // (after this layer's fetch, so its slots are at the LRU front and no prefetch evicts them)
-        if (prefetch_k > 0 && il + 1 < c.n_layer && !next_pred.empty()) {
+        const int pl = il + prefetch_dist;
+        if (prefetch_k > 0 && pl < c.n_layer && !next_pred.empty()) {
             std::vector<int> keys;
             std::vector<ExpertRam::Src> src;
             for (int k = 0; k < std::min<int>(prefetch_k, next_pred.size()); ++k) {
-                const int key = (il + 1) * c.n_expert + next_pred[k];
+                const int key = pl * c.n_expert + next_pred[k];
                 if (where.count(key) || ram->contains(key)) continue;
                 keys.push_back(key);
-                src.push_back(src_of(il + 1, next_pred[k]));
+                src.push_back(src_of(pl, next_pred[k]));
             }
             if (!keys.empty()) {
                 if (admit_pending && !exclusive) {   // an admission copy may still read a RAM slot a prefetch could evict
