@@ -216,11 +216,12 @@ class Lfu:
 
 
 def simulate(steps, vram, ram, warm, admit=1, exclusive=False, prefetch=0, ram_policy='lru', vram_policy='lru',
-             tail=False):
+             tail=False, ghost=0):
     cnt = defaultdict(float)
     V = Lru(vram) if vram_policy == 'lru' else Lfu(vram, cnt)
     R = {'lru': Lru, 'slru': Slru, 'arc': Arc, 'lru2': Lru2}[ram_policy](ram) if ram_policy != 'lfu' else Lfu(ram, cnt)
-    vm = dr = pf = pf_used = 0
+    vm = dr = pf = pf_used = adm = 0
+    seen = Lru(ghost) if ghost else None   # admission filter: a key enters VRAM on its second miss within `ghost`
     n = 0
     pending = set()   # prefetched keys not used yet
     for si, layers in enumerate(steps):
@@ -249,7 +250,14 @@ def simulate(steps, vram, ram, warm, admit=1, exclusive=False, prefetch=0, ram_p
                     if measure:
                         dr += 1
                     R.add(k)
-            for k in misses[:admit]:   # into VRAM
+            cand = misses
+            if seen is not None:
+                cand = [k for k in misses if k in seen]
+                for k in misses:
+                    seen.add(k)
+            for k in cand[:admit]:   # into VRAM
+                if measure:
+                    adm += 1
                 ev = V.add(k)
                 if exclusive:
                     R.discard(k)
@@ -268,7 +276,7 @@ def simulate(steps, vram, ram, warm, admit=1, exclusive=False, prefetch=0, ram_p
                         pf += 1
                         dr += 1
     n = max(n, 1)
-    return dict(vram_miss=vm / n, disk=dr / n, prefetch=pf / n, prefetch_used=pf_used / n)
+    return dict(vram_miss=vm / n, disk=dr / n, prefetch=pf / n, prefetch_used=pf_used / n, admit=adm / n)
 
 
 def belady(steps, cap, warm):

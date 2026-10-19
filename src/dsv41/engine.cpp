@@ -158,6 +158,8 @@ struct Dsv41Engine::Impl {
     cudaEvent_t ev_a = nullptr, ev_b = nullptr;
     bool ev_a_set = false;
     double t_gpu_pre = 0, t_span = 0;
+    double t_gpu_wait_by[3] = {};   // layers with no miss / misses all on the CPU / an early admission
+    uint64_t n_gpu_wait_by[3] = {};
     std::chrono::steady_clock::time_point span0;   // t_router: waiting for the GPU at the router
     // BL_DSV41_PRED=1 (measurement): layer il+1's router on layer il's FFN input; are the misses that go to disk among
     // its picks? (prefetch candidates)
@@ -184,6 +186,25 @@ struct Dsv41Engine::Impl {
     // computed on the GPU (the admission copy would happen anyway), the CPU takes the rest
     int early = std::getenv("BL_DSV41_EARLY") ? std::atoi(std::getenv("BL_DSV41_EARLY")) : 1;
     // BL_DSV41_EARLY_ADAPT=1: up to BL_DSV41_EARLY, ~0.36 of the layer's misses
+    // BL_DSV41_GHOST=G (default 1000, 0 = off): an expert enters VRAM only on its second VRAM miss within the last G
+    // misses (each admission costs 9 MB up and 9 MB back over PCIe and DRAM; tools/dsv41_cache_sim.py: 49% fewer
+    // admissions, 1.5% fewer misses)
+    int ghost_n = std::getenv("BL_DSV41_GHOST") ? std::atoi(std::getenv("BL_DSV41_GHOST")) : 1000;
+    std::list<int> ghost_lru;
+    std::unordered_map<int, std::list<int>::iterator> ghost_at;
+    bool ghost_check(int key) {   // was it missed recently? (and remember this miss)
+        if (ghost_n <= 0) return true;
+        auto it = ghost_at.find(key);
+        const bool seen = it != ghost_at.end();
+        if (seen) ghost_lru.erase(it->second);
+        ghost_lru.push_front(key);
+        ghost_at[key] = ghost_lru.begin();
+        if (static_cast<int>(ghost_lru.size()) > ghost_n) {
+            ghost_at.erase(ghost_lru.back());
+            ghost_lru.pop_back();
+        }
+        return seen;
+    }
     bool adaptive_early = std::getenv("BL_DSV41_EARLY_ADAPT") && std::atoi(std::getenv("BL_DSV41_EARLY_ADAPT")) != 0;
     uint64_t gpu_misses = 0;
     // VRAM slots kept free (their expert already copied back to RAM, off the critical path) so an early admission is
@@ -948,7 +969,8 @@ struct Dsv41Engine::Impl {
         const int n = static_cast<int>(ck_.size());
         std::vector<const uint8_t *> slot(n);
         std::vector<int> rslot(n);
-        int nready = n;
+        std::vector<char> admissible(n, 1);
+        int nready = n, npass_ready = 0;
         const auto t0 = std::chrono::steady_clock::now();
         if (n) {   // the misses from the RAM tier; the ones not there start reading from disk, all at once
             std::vector<int> keys(n);
@@ -958,17 +980,22 @@ struct Dsv41Engine::Impl {
                 ck(cudaEventSynchronize(ev_admit), "admission");
                 admit_pending = false;
             }
-            std::vector<char> ready(n);
+            std::vector<char> ready(n), pass(n);
             ram->start(keys.data(), src.data(), n, slot.data(), rslot.data(), ready.data());
-            // the usable ones first: they are computed while the disk reads run
+            for (int j = 0; j < n; ++j) pass[j] = ghost_check(keys[j]);
+            // the usable ones first (computed while the disk reads run), among them the admissible ones first
             std::vector<int> ord(n);
             std::iota(ord.begin(), ord.end(), 0);
-            std::stable_partition(ord.begin(), ord.end(), [&](int j) { return ready[j] != 0; });
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+                return std::make_pair(!ready[a], !pass[a]) < std::make_pair(!ready[b], !pass[b]);
+            });
             nready = static_cast<int>(std::count(ready.begin(), ready.end(), 1));
+            for (int j = 0; j < n; ++j) npass_ready += ready[j] && pass[j];
             std::vector<int> ck2(n), rs2(n);
+            std::vector<char> pa2(n);
             std::vector<const uint8_t *> sl2(n);
-            for (int j = 0; j < n; ++j) { ck2[j] = ck_[ord[j]]; rs2[j] = rslot[ord[j]]; sl2[j] = slot[ord[j]]; }
-            ck_.swap(ck2); rslot.swap(rs2); slot.swap(sl2);
+            for (int j = 0; j < n; ++j) { ck2[j] = ck_[ord[j]]; rs2[j] = rslot[ord[j]]; sl2[j] = slot[ord[j]]; pa2[j] = pass[ord[j]]; }
+            ck_.swap(ck2); rslot.swap(rs2); slot.swap(sl2); admissible.swap(pa2);
         }
         // the next layer's likely experts that are in neither tier: read in the background while this layer computes
         // (after this layer's fetch, so its slots are at the LRU front and no prefetch evicts them)
@@ -993,7 +1020,7 @@ struct Dsv41Engine::Impl {
         // the first ng misses: admitted now and computed on the GPU once their copy lands, while the CPU does the rest
         // how many: balance a GPU miss (~0.8 ms: the copy, then compute) against a CPU one (~0.45 ms): k ~ 0.36 n
         const int want = adaptive_early ? std::max(1, static_cast<int>((n + 1) * 0.36f)) : early;
-        const int ng = n >= 2 && exclusive ? std::min({want, early, n - 1, nready, static_cast<int>(free_vslots.size())}) : 0;
+        const int ng = n >= 2 && exclusive ? std::min({want, early, n - 1, npass_ready, static_cast<int>(free_vslots.size())}) : 0;
         if (ng > 0) {
             const auto ta = std::chrono::steady_clock::now();
             std::memset(plan2_h, 0, sizeof *plan2_h);
@@ -1035,7 +1062,8 @@ struct Dsv41Engine::Impl {
             for (int j = 0; j < nc; ++j) cuda::axpy(moe, cpu_out_d + static_cast<size_t>(j) * D, hw[ck_[ng + j]], D, st);
             if (ng == 0) {   // admit a few: their pages are hot now, so the copies come from RAM
                 const auto ta = std::chrono::steady_clock::now();
-                for (int j = 0; j < std::min(nc, admit); ++j) admit_expert(il, hid[ck_[j]]);
+                for (int j = 0, a = 0; j < n && a < admit; ++j)
+                    if (admissible[j]) { admit_expert(il, hid[ck_[j]]); ++a; }
                 t_admit += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
             }
         }
@@ -1043,7 +1071,10 @@ struct Dsv41Engine::Impl {
             while (static_cast<int>(free_vslots.size()) < free_target && static_cast<int>(lru.size()) > 2 * c.n_expert_used) free_vslot();
         const auto t1 = std::chrono::steady_clock::now();
         ck(cudaStreamSynchronize(st), "moe");   // cpu_out_h is rewritten by the next layer
-        t_gpu_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        const double gw = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        t_gpu_wait += gw;
+        t_gpu_wait_by[ng > 0 ? 2 : (n > 0 ? 1 : 0)] += gw;
+        ++n_gpu_wait_by[ng > 0 ? 2 : (n > 0 ? 1 : 0)];
     }
 
     // y [N][M] = x [N][K] . W^T for the named matrix
@@ -1468,6 +1499,7 @@ void Dsv41Engine::reset_stats() {
     q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_router = q.t_admit = q.t_prefill = 0;
     for (double & t : q.t_host) t = 0;
     q.t_gpu_pre = q.t_span = 0;
+    for (int i = 0; i < 3; ++i) { q.t_gpu_wait_by[i] = 0; q.n_gpu_wait_by[i] = 0; }
     q.n_steps = 0;
     q.n_prefill = 0;
     q.hits = q.misses = q.cpu_experts = q.demoted = q.gpu_misses = 0;
@@ -1488,7 +1520,10 @@ std::string Dsv41Engine::report() const {
     if (q.hybrid)
         os << "; GPU-computed misses " << static_cast<double>(q.gpu_misses) / ns << "/token; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
            << " ms (of it RAM tier / disk " << 1000.0 * q.t_ram / ns << " ms), then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms; router wait " << 1000.0 * q.t_router / ns
-           << " ms (GPU time MoE end -> router " << 1000.0 * q.t_gpu_pre / ns << " ms, wall " << 1000.0 * q.t_span / ns << " ms), admissions " << 1000.0 * q.t_admit / ns << " ms; host per step: engram " << 1000.0 * q.t_host[0] / ns
+           << " ms (GPU time MoE end -> router " << 1000.0 * q.t_gpu_pre / ns << " ms, wall " << 1000.0 * q.t_span / ns << " ms), admissions " << 1000.0 * q.t_admit / ns << " ms; GPU wait by layer kind (no miss / CPU only / early): "
+           << 1000.0 * q.t_gpu_wait_by[0] / ns << " / " << 1000.0 * q.t_gpu_wait_by[1] / ns << " / " << 1000.0 * q.t_gpu_wait_by[2] / ns
+           << " ms over " << 1.0 * q.n_gpu_wait_by[0] / ns << " / " << 1.0 * q.n_gpu_wait_by[1] / ns << " / " << 1.0 * q.n_gpu_wait_by[2] / ns
+           << " layers; host per step: engram " << 1000.0 * q.t_host[0] / ns
            << " ms, attention sublayer " << 1000.0 * q.t_host[1] / ns << ", FFN pre " << 1000.0 * q.t_host[2] / ns << ", MoE + post "
            << 1000.0 * q.t_host[3] / ns << " ms";
     if (q.pred_stats)
