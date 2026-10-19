@@ -1464,14 +1464,22 @@ struct Dsv41Engine::Impl {
         std::vector<float> wv(A);
         std::vector<cuda::MoeItem> items;
         const auto t0 = std::chrono::steady_clock::now();
-        {   // the experts not in VRAM: into RAM in one parallel read first, so the copies below come from memory
-            std::vector<int> need;
+        {   // the experts not in VRAM: their reads all queued at once (in expert order); each copy below waits only for its
+            // own expert, so the copies run behind the reads instead of after all of them
+            std::vector<int> need, keys;
+            std::vector<ExpertRam::Src> src;
             for (int i = 0; i < A; ++i) {
                 const int e = hid[order[i]];
                 if ((i == 0 || e != hid[order[i - 1]]) && !where.count(il * c.n_expert + e)) need.push_back(e);
             }
-            std::vector<const uint8_t *> dummy(need.size());
-            if (!need.empty()) ram_get(il, need.data(), static_cast<int>(need.size()), dummy.data());
+            for (int e : need) { keys.push_back(il * c.n_expert + e); src.push_back(src_of(il, e)); }
+            if (!need.empty()) {
+                if (admit_pending && !exclusive) { ck(cudaEventSynchronize(ev_admit), "admission"); admit_pending = false; }
+                std::vector<const uint8_t *> out(need.size());
+                std::vector<int> slots(need.size());
+                std::vector<char> ready(need.size());
+                ram->start(keys.data(), src.data(), static_cast<int>(need.size()), out.data(), slots.data(), ready.data());
+            }
         }
         const int tile = cuda::moe_tile();
         for (int i = 0; i < A;) {
