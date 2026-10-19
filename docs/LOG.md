@@ -715,14 +715,17 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 | split-K 注意力（8 个头共用一次 key 读取） | 112.7 | 路由前 GPU 等待 14.9 → 12.5 ms（总时间被读盘波动盖住） |
 | logits 与 step 开头的上传走锁页缓冲 | 110 | |
 | q_a+kv、共享专家 gate+up 各合成一次发射（同一块分配，不复制） | 109.9 | 显存碎片少了，缓存多 13 个槽 |
-| 准入过滤：一个专家在最近 1000 次未命中里第二次出现才进 VRAM | **106.3** | 每次拷入 = 9 MB 上 + 9 MB 回，占 PCIe 和内存带宽；回拷减半 |
+| 准入过滤：一个专家在最近 1000 次未命中里第二次出现才进 VRAM | 106.3 | 每次拷入 = 9 MB 上 + 9 MB 回，占 PCIe 和内存带宽；回拷减半 |
+| matvec 循环 `#pragma unroll 4`（共用 kernel，Qwen3.8 logits 逐字节不变） | 107 | wo_b 70 → 58 us |
+| 从盘读的专家：gate/up 两段到了就先算，down 到了再算 | 107 | 等盘 49.8 → 48.2 ms |
+| 自己的单行 rmsnorm（1024 线程）、q_a/kv 两个 norm 一次发射；路由阶段 4 个小拷贝一次发射；Sinkhorn 并进 hc_fn 的最后一个 block；注意力 16 个 key 一块 | **104.8** | 路由前等待 12.1 → 10.0 ms |
 
-- 三段文本：zh 203 → 106、cuda 158 → 96、en 222 → 113 ms/token（9–10 tok/s）。
+- 三段文本：zh 203 → 105、cuda 158 → 89、en 222 → 113 ms/token（8.8–11.2 tok/s）。
 - CPU 专家：IQ2_XXS 在 K = 5120 上每线程 3.1 GB/s，冷热数据一样，线程数线性（`tests/bench_dsv41_cpu.cpp`），是解码算力的
   上限，不是内存；gather 取码本没有变化。`bench_cpu` 的尺寸是 Qwen 的，对这个模型的数字不能用。
 - 没用的：直接 O_DIRECT 读进槽位（去掉中转 memcpy，中转缓冲本来就在 L3）；把一部分未命中经临时槽交给 GPU
   （按 0.77 / 0.49 ms 的代价平衡也一样：拷贝串行，GPU 端等待抵掉 CPU 的节省）；x 放 shared memory 的 matvec（更慢）；
-  LFU / SLRU / ARC / LRU-2 都不如 LRU（模拟）；预读 top-16 把盘塞满（257 ms）；CPU 线程 8/12/16 无差别（IQ2_XXS
+  LFU / SLRU / ARC / LRU-2 都不如 LRU（模拟）；RAM 层也加准入过滤（模拟：读盘 12.9 → 14.6–19.5 次/步）；预读 top-16 把盘塞满（257 ms）；CPU 线程 8/12/16 无差别（IQ2_XXS
   解码算力受限，利用率 96%）；3 个 IO 线程；自适应早拷入个数；`BL_CPU_SPINS`。
 - 事故：`BL_DSV41_RAM_GB=56` 的锁页池把内存用尽，机器死机重启。现在池子最多 MemAvailable − 8 GB；默认留 12 GB
   （运行中 MemAvailable 最低 11.4 GB）。
