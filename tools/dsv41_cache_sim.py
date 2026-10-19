@@ -95,6 +95,99 @@ class Slru:
         self.prob.to_tail(k)
 
 
+class Arc:
+    """ARC (Megiddo & Modha): recency list T1 and frequency list T2 with ghost lists B1/B2 steering the split p"""
+    def __init__(self, n):
+        self.c, self.p = n, 0
+        self.t1, self.t2, self.b1, self.b2 = OrderedDict(), OrderedDict(), OrderedDict(), OrderedDict()
+
+    def __contains__(self, k):
+        return k in self.t1 or k in self.t2
+
+    def touch(self, k):
+        if k in self.t1:
+            del self.t1[k]
+            self.t2[k] = 1
+        elif k in self.t2:
+            self.t2.move_to_end(k)
+
+    def _replace(self, k):
+        if self.t1 and (len(self.t1) > self.p or (k in self.b2 and len(self.t1) == self.p)):
+            v, _ = self.t1.popitem(last=False)
+            self.b1[v] = 1
+        else:
+            v, _ = self.t2.popitem(last=False)
+            self.b2[v] = 1
+        return v
+
+    def add(self, k):
+        if k in self:
+            self.touch(k)
+            return None
+        ev = None
+        if k in self.b1:
+            self.p = min(self.c, self.p + max(len(self.b2) // max(len(self.b1), 1), 1))
+            ev = self._replace(k)
+            del self.b1[k]
+            self.t2[k] = 1
+            return ev
+        if k in self.b2:
+            self.p = max(0, self.p - max(len(self.b1) // max(len(self.b2), 1), 1))
+            ev = self._replace(k)
+            del self.b2[k]
+            self.t2[k] = 1
+            return ev
+        if len(self.t1) + len(self.b1) == self.c:
+            if len(self.t1) < self.c:
+                self.b1.popitem(last=False)
+                ev = self._replace(k)
+            else:
+                ev, _ = self.t1.popitem(last=False)
+        elif len(self.t1) + len(self.t2) + len(self.b1) + len(self.b2) >= self.c:
+            if len(self.t1) + len(self.t2) + len(self.b1) + len(self.b2) == 2 * self.c:
+                self.b2.popitem(last=False)
+            if len(self.t1) + len(self.t2) >= self.c:
+                ev = self._replace(k)
+        self.t1[k] = 1
+        return ev
+
+    def discard(self, k):
+        self.t1.pop(k, None)
+        self.t2.pop(k, None)
+
+
+class Lru2:
+    """LRU-2: evicts the key whose second-to-last use is oldest (keys used once first, by last use)"""
+    def __init__(self, n):
+        self.n, self.t, self.h, self.hist = n, 0, [], {}
+        self.res = set()
+
+    def __contains__(self, k):
+        return k in self.res
+
+    def touch(self, k):
+        self.t += 1
+        a = self.hist.get(k, (-1, -1))
+        self.hist[k] = (a[1], self.t)
+        heapq.heappush(self.h, (self.hist[k], k))
+
+    def add(self, k):
+        self.touch(k)
+        if k in self.res:
+            return None
+        self.res.add(k)
+        if len(self.res) > self.n:
+            while True:
+                hv, v = heapq.heappop(self.h)
+                if v in self.res and self.hist[v] == hv:
+                    self.res.discard(v)
+                    return v
+        return None
+
+    def discard(self, k):
+        self.res.discard(k)
+
+
 class Lfu:
     """evicts the lowest (use count, last use) among the resident keys; a heap with stale entries skipped"""
     def __init__(self, n, cnt):
@@ -126,7 +219,7 @@ def simulate(steps, vram, ram, warm, admit=1, exclusive=False, prefetch=0, ram_p
              tail=False):
     cnt = defaultdict(float)
     V = Lru(vram) if vram_policy == 'lru' else Lfu(vram, cnt)
-    R = {'lru': Lru, 'slru': Slru}[ram_policy](ram) if ram_policy != 'lfu' else Lfu(ram, cnt)
+    R = {'lru': Lru, 'slru': Slru, 'arc': Arc, 'lru2': Lru2}[ram_policy](ram) if ram_policy != 'lfu' else Lfu(ram, cnt)
     vm = dr = pf = pf_used = 0
     n = 0
     pending = set()   # prefetched keys not used yet
@@ -237,6 +330,9 @@ def main():
         ('exclusive, RAM SLRU', dict(exclusive=True, ram_policy='slru')),
         ('exclusive, RAM SLRU, admit 2', dict(exclusive=True, ram_policy='slru', admit=2)),
         ('exclusive, prefetch 2', dict(exclusive=True, prefetch=2)),
+        ('exclusive, RAM ARC', dict(exclusive=True, ram_policy='arc')),
+        ('exclusive, RAM LRU-2', dict(exclusive=True, ram_policy='lru2')),
+        ('RAM ARC', dict(ram_policy='arc')),
         ('prefetch 2', dict(prefetch=2)),
         ('prefetch 6', dict(prefetch=6)),
     ]

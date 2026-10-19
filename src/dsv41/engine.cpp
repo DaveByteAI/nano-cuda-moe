@@ -147,7 +147,9 @@ struct Dsv41Engine::Impl {
     uint64_t demoted = 0;
     std::unique_ptr<CpuExperts> cpu;
     float * x_h = nullptr, * cpu_out_h = nullptr, * cpu_out_d = nullptr;
-    double t_cpu = 0, t_gpu_wait = 0, t_ram = 0;
+    double t_cpu = 0, t_gpu_wait = 0, t_ram = 0, t_router = 0, t_admit = 0;
+    // host time per stretch of a decode step (launches included): engram, attention sublayer, FFN pre, moe_ffn
+    double t_host[4] = {};   // t_router: waiting for the GPU at the router
     // BL_DSV41_PRED=1 (measurement): layer il+1's router on layer il's FFN input; are the misses that go to disk among
     // its picks? (prefetch candidates)
     bool pred_stats = std::getenv("BL_DSV41_PRED") && std::atoi(std::getenv("BL_DSV41_PRED")) != 0;
@@ -168,6 +170,16 @@ struct Dsv41Engine::Impl {
     uint64_t pred_disk = 0, pred_disk_hit = 0, pred_all = 0, pred_all_hit = 0;
     uint64_t cpu_experts = 0;
     cuda::ExpertPlan * plan_h = nullptr, * plan_d = nullptr;
+    cuda::ExpertPlan * plan2_h = nullptr, * plan2_d = nullptr;   // hybrid: the misses admitted early, a second plan
+    // BL_DSV41_EARLY=n (default 1): with two misses or more in a layer, up to n of them are copied into VRAM first and
+    // computed on the GPU (the admission copy would happen anyway), the CPU takes the rest
+    int early = std::getenv("BL_DSV41_EARLY") ? std::atoi(std::getenv("BL_DSV41_EARLY")) : 1;
+    uint64_t gpu_misses = 0;
+    // VRAM slots kept free (their expert already copied back to RAM, off the critical path) so an early admission is
+    // one host-to-device copy on its own stream, waiting for nothing else; BL_DSV41_FREE_SLOTS (default 4)
+    int free_target = std::getenv("BL_DSV41_FREE_SLOTS") ? std::atoi(std::getenv("BL_DSV41_FREE_SLOTS")) : 4;
+    std::vector<int> free_vslots;
+    cudaStream_t ust = nullptr;
     void * xq = nullptr;
     float * pact = nullptr, * pout = nullptr;
     float * logits_d = nullptr;
@@ -394,6 +406,8 @@ struct Dsv41Engine::Impl {
         if (dp4a) {
             ck(cudaMallocHost(&plan_h, sizeof(cuda::ExpertPlan)), "pinned");
             plan_d = dalloc<cuda::ExpertPlan>(1);
+            ck(cudaMallocHost(&plan2_h, sizeof(cuda::ExpertPlan)), "pinned");
+            plan2_d = dalloc<cuda::ExpertPlan>(1);
             xq = dalloc<uint8_t>(cuda::q8_bytes(D));
             pact = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * c.n_ff_exp);
             pout = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * D);
@@ -438,6 +452,7 @@ struct Dsv41Engine::Impl {
         xslots = dalloc<uint8_t>(static_cast<size_t>(n_slots) * per);
         slot_key.assign(n_slots, -1);
         ck(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking), "copy stream");
+        ck(cudaStreamCreateWithFlags(&ust, cudaStreamNonBlocking), "copy stream");
         slot_ready.assign(n_slots, nullptr);
         slot_pending.assign(n_slots, 0);
         for (auto & e : slot_ready) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
@@ -472,6 +487,45 @@ struct Dsv41Engine::Impl {
     }
 
     // expert e of layer il into a VRAM slot on the copy stream (hybrid decode's admissions)
+    // the LRU tail out of VRAM into the free list (copied back to RAM first when exclusive)
+    void free_vslot() {
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        const int slot = lru.back();
+        lru.pop_back();
+        const int old = slot_key[slot];
+        if (old >= 0) where.erase(old);
+        slot_key[slot] = -1;
+        ck(cudaEventRecord(ev_compute, st), "event");   // queued compute may still read it
+        ck(cudaStreamWaitEvent(cst, ev_compute, 0), "wait compute");
+        if (slot_pending[slot]) ck(cudaStreamWaitEvent(cst, slot_ready[slot], 0), "wait admission");
+        cudaEvent_t ev = slot_ready[slot];
+        if (exclusive && old >= 0)
+            if (uint8_t * back = ram->insert(old, ev)) {
+                ck(cudaMemcpyAsync(back, xslots + static_cast<size_t>(slot) * per, per, cudaMemcpyDeviceToHost, cst), "demote");
+                ++demoted;
+            }
+        ck(cudaEventRecord(ev, cst), "event");
+        slot_pending[slot] = 1;
+        free_vslots.push_back(slot);
+    }
+    // expert e of layer il into a free VRAM slot, one copy on the urgent stream (exclusive tiers only)
+    void admit_urgent(int il, int e) {
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        const int key = il * c.n_expert + e;
+        const int slot = free_vslots.back();
+        free_vslots.pop_back();
+        slot_key[slot] = key;
+        lru.push_front(slot);
+        where[key] = lru.begin();
+        const uint8_t * src = nullptr;
+        ram_get(il, &e, 1, &src);
+        if (slot_pending[slot]) ck(cudaStreamWaitEvent(ust, slot_ready[slot], 0), "wait demotion");
+        ck(cudaMemcpyAsync(xslots + static_cast<size_t>(slot) * per, src, per, cudaMemcpyHostToDevice, ust), "admit");
+        ck(cudaEventRecord(slot_ready[slot], ust), "event");
+        ram->drop(key, slot_ready[slot]);
+        slot_pending[slot] = 1;
+    }
+
     void admit_expert(int il, int e) {
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
         const int key = il * c.n_expert + e;
@@ -559,12 +613,14 @@ struct Dsv41Engine::Impl {
         if (st) cudaStreamSynchronize(st);
         if (trace) std::fclose(trace);
         if (cst) { cudaStreamSynchronize(cst); cudaStreamDestroy(cst); }
+        if (ust) { cudaStreamSynchronize(ust); cudaStreamDestroy(ust); }
         for (auto e : slot_ready) if (e) cudaEventDestroy(e);
         if (ev_compute) cudaEventDestroy(ev_compute);
         if (ev_admit) cudaEventDestroy(ev_admit);
         for (void * p : allocs) cudaFree(p);
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
+        if (plan2_h) cudaFreeHost(plan2_h);
         if (pf.erows_h) cudaFreeHost(pf.erows_h);
         ram.reset();
         for (int fd : direct_fd) if (fd >= 0) ::close(fd);
@@ -693,6 +749,7 @@ struct Dsv41Engine::Impl {
         cuda::dsv41::router_topk(logit_e, V(p + "exp_probs_b.bias"), c.n_expert, K, static_cast<float>(c.expert_scale), ids, wsel, st);
         std::vector<int> hid(K);
         std::vector<float> hw(K);
+        const auto tr0 = std::chrono::steady_clock::now();   // (a copy into pageable memory waits for the stream)
         ck(cudaMemcpyAsync(hid.data(), ids, K * 4, cudaMemcpyDeviceToHost, st), "ids");
         ck(cudaMemcpyAsync(hw.data(), wsel, K * 4, cudaMemcpyDeviceToHost, st), "w");
         // the next layer's router on this layer's FFN input: the experts it will likely pick (one sync with this one's)
@@ -707,6 +764,7 @@ struct Dsv41Engine::Impl {
             ck(cudaMemcpyAsync(next_pred.data(), pred_ids_d, nk * 4, cudaMemcpyDeviceToHost, st), "pred");
         }
         ck(cudaStreamSynchronize(st), "router");
+        t_router += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
         if (trace) {
             std::fprintf(trace, "%d %d:", cur_pos, il);
             for (int k = 0; k < K; ++k) std::fprintf(trace, " %d", hid[k]);
@@ -837,19 +895,48 @@ struct Dsv41Engine::Impl {
                 ram->prefetch(keys.data(), src.data(), static_cast<int>(keys.size()));
             }
         }
-        if (n) {
+        // the first ng misses: admitted now and computed on the GPU once their copy lands, while the CPU does the rest
+        const int ng = n >= 2 && exclusive ? std::min({early, n - 1, static_cast<int>(free_vslots.size())}) : 0;
+        if (ng > 0) {
+            const auto ta = std::chrono::steady_clock::now();
+            std::memset(plan2_h, 0, sizeof *plan2_h);
+            plan2_h->T = 1; plan2_h->K = ng; plan2_h->n_slots = ng;
+            for (int j = 0; j < ng; ++j) {
+                const int e = hid[ck_[j]];
+                admit_urgent(il, e);
+                const int vs = *where.at(il * c.n_expert + e);
+                use_slot(vs);   // the compute stream waits for the copy
+                plan2_h->ids[j] = e; plan2_h->kind[j] = cuda::kHit; plan2_h->mask[j] = 1;
+                plan2_h->base[j] = xslots + static_cast<size_t>(vs) * (2 * gu_expert_bytes + d_expert_bytes);
+                plan2_h->sel[0][j] = j; plan2_h->w[0][j] = hw[ck_[j]];
+            }
+            t_admit += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
+            ck(cudaMemcpyAsync(plan2_d, plan2_h, sizeof *plan2_h, cudaMemcpyHostToDevice, st), "plan");
+            if (gk.empty()) cuda::quantize_q8(x, D, xq, st);
+            cuda::plan_gate_up(expert_type, plan2_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, xq, pact, st, lim);
+            cuda::plan_down(expert_type, plan2_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, pact, pout, st);
+            for (int j = 0; j < ng; ++j) cuda::axpy(moe, pout + static_cast<size_t>(j) * cuda::kMaxT * D, hw[ck_[j]], D, st);
+            gpu_misses += ng;
+        }
+        if (n > ng) {
+            const int nc = n - ng;
             // x was final before the router's sync; a pinned copy is a few microseconds
             ck(cudaMemcpy(x_h, x, D * 4, cudaMemcpyDeviceToHost), "x");
-            std::vector<CpuExperts::Job> jobs(n);
-            for (int j = 0; j < n; ++j) jobs[j] = {slot[j], 1, cpu_out_h + static_cast<size_t>(j) * D};
-            cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), n, lim);
-            cpu_experts += n;
+            std::vector<CpuExperts::Job> jobs(nc);
+            for (int j = 0; j < nc; ++j) jobs[j] = {slot[ng + j], 1, cpu_out_h + static_cast<size_t>(j) * D};
+            cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), nc, lim);
+            cpu_experts += nc;
             t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            ck(cudaMemcpyAsync(cpu_out_d, cpu_out_h, sizeof(float) * n * D, cudaMemcpyHostToDevice, st), "cpu out");
-            for (int j = 0; j < n; ++j) cuda::axpy(moe, cpu_out_d + static_cast<size_t>(j) * D, hw[ck_[j]], D, st);
-            // admit a few: their pages are hot now, so the copies come from RAM
-            for (int j = 0; j < std::min(n, admit); ++j) admit_expert(il, hid[ck_[j]]);
+            ck(cudaMemcpyAsync(cpu_out_d, cpu_out_h, sizeof(float) * nc * D, cudaMemcpyHostToDevice, st), "cpu out");
+            for (int j = 0; j < nc; ++j) cuda::axpy(moe, cpu_out_d + static_cast<size_t>(j) * D, hw[ck_[ng + j]], D, st);
+            if (ng == 0) {   // admit a few: their pages are hot now, so the copies come from RAM
+                const auto ta = std::chrono::steady_clock::now();
+                for (int j = 0; j < std::min(nc, admit); ++j) admit_expert(il, hid[ck_[j]]);
+                t_admit += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
+            }
         }
+        if (exclusive && early > 0)   // free slots for the next early admissions, the copies back behind this layer's work
+            while (static_cast<int>(free_vslots.size()) < free_target && static_cast<int>(lru.size()) > 2 * c.n_expert_used) free_vslot();
         const auto t1 = std::chrono::steady_clock::now();
         ck(cudaStreamSynchronize(st), "moe");   // cpu_out_h is rewritten by the next layer
         t_gpu_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
@@ -1214,7 +1301,14 @@ struct Dsv41Engine::Impl {
         for (int il = 0; il < c.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
             const int eg = c.engram_index(il);
+            auto h0 = std::chrono::steady_clock::now();
+            auto lap = [&](int i) {
+                const auto h1 = std::chrono::steady_clock::now();
+                t_host[i] += std::chrono::duration<double>(h1 - h0).count();
+                h0 = h1;
+            };
             if (eg >= 0 && engram_on) engram(il, eg, erow.data());
+            lap(0);
 
             // attention sublayer: collapses with the mix the previous sublayer made
             mv(p + "hc_attn_fn.weight", R, mix);
@@ -1228,6 +1322,7 @@ struct Dsv41Engine::Impl {
             cuda::dsv41::hc_post(ao, R, post, comb, R2, hc, D, st);
             std::swap(R, R2);
             P("hc_attn_post", il, R, c.hc_dim());
+            lap(1);
 
             // FFN sublayer: collapses with the attention's mix; its own pre goes to the next layer's attention
             mv(p + "hc_ffn_fn.weight", R, mix);
@@ -1237,10 +1332,12 @@ struct Dsv41Engine::Impl {
             P("hc_ffn_pre", il, x, D);
             norm(x, x, D, p + "ffn_norm.weight");
             P("ffn_norm", il, x, D);
+            lap(2);
             moe_ffn(il);
             cuda::dsv41::hc_post(ffo, R, post, comb, R2, hc, D, st);
             std::swap(R, R2);
             P("l_last", il, R, c.hc_dim());
+            lap(3);
         }
         // the last FFN's mix collapses the copies (there is no separate hc head)
         cuda::dsv41::hc_pre(R, pre, x, hc, D, st);
@@ -1267,10 +1364,11 @@ const std::vector<float> & Dsv41Engine::prefill(const std::vector<int> & t, std:
 void Dsv41Engine::set_probe(Probe p) { p_->probe = std::move(p); }
 void Dsv41Engine::reset_stats() {
     auto & q = *p_;
-    q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_prefill = 0;
+    q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_router = q.t_admit = q.t_prefill = 0;
+    for (double & t : q.t_host) t = 0;
     q.n_steps = 0;
     q.n_prefill = 0;
-    q.hits = q.misses = q.cpu_experts = q.demoted = 0;
+    q.hits = q.misses = q.cpu_experts = q.demoted = q.gpu_misses = 0;
     q.pred_disk = q.pred_disk_hit = q.pred_all = q.pred_all_hit = 0;
     if (q.ram) { q.ram->hits = q.ram->reads = q.ram->prefetched = q.ram->prefetch_used = q.ram->prefetch_waits = 0; q.ram->read_s = 0; }
 }
@@ -1286,8 +1384,11 @@ std::string Dsv41Engine::report() const {
        << "expert cache hit rate " << (q.hits + q.misses ? 100.0 * q.hits / (q.hits + q.misses) : 0.0) << "% of "
        << q.hits + q.misses;
     if (q.hybrid)
-        os << "; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
-           << " ms (of it RAM tier / disk " << 1000.0 * q.t_ram / ns << " ms), then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms";
+        os << "; GPU-computed misses " << static_cast<double>(q.gpu_misses) / ns << "/token; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
+           << " ms (of it RAM tier / disk " << 1000.0 * q.t_ram / ns << " ms), then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms; router wait " << 1000.0 * q.t_router / ns
+           << " ms, admissions " << 1000.0 * q.t_admit / ns << " ms; host per step: engram " << 1000.0 * q.t_host[0] / ns
+           << " ms, attention sublayer " << 1000.0 * q.t_host[1] / ns << ", FFN pre " << 1000.0 * q.t_host[2] / ns << ", MoE + post "
+           << 1000.0 * q.t_host[3] / ns << " ms";
     if (q.pred_stats)
         os << "; next-layer prediction (top " << q.pred_k << "): " << 100.0 * q.pred_all_hit / std::max<uint64_t>(q.pred_all, 1)
            << "% of all picks, " << 100.0 * q.pred_disk_hit / std::max<uint64_t>(q.pred_disk, 1) << "% of the " << q.pred_disk << " disk reads";
