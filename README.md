@@ -146,7 +146,7 @@ acrogenesis' `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram` GGUF (10
 included; `scripts/download_dsv41.sh`), picked by the file's architecture:
 
 ```bash
-build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 32k
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
 ```
 
 Its 140 GB of experts live in three tiers (VRAM, a pinned RAM pool, the NVMe), so the first ~40 s go to warming the

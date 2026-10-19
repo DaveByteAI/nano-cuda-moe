@@ -10,7 +10,7 @@ boundless `dsv41` 分支的实现依据。来源：
 
 ```bash
 build/bl-chat   --model ../models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 8192
-build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 32k --port 8080     # OpenAI 接口 + 网页
+build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16k --port 8080     # OpenAI 接口 + 网页（上下文目前最多 16384）
 ```
 
 - 两个程序按 GGUF 的架构名自动选引擎（`bl::open_chat`）。分词用 libllama（架构名不认识时用只有元数据的临时副本加载词表，

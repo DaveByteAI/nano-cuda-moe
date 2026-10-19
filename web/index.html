@@ -279,6 +279,17 @@ button { font: inherit; color: inherit; cursor: pointer; background: none; borde
   <div class="f"><div class="top"><span>人设 System</span></div><textarea id="system" placeholder="例如：你是一位克制、严谨的技术编辑，回答简洁。"></textarea></div>
 </aside>
 <script>
+// the loaded model's family (GET /bl/models): the brand line and the welcome text follow it
+let FAMILY = '';
+function familyName() {
+  return FAMILY.startsWith('deepseek') ? 'DeepSeek V4.1' : FAMILY.startsWith('qwen') ? 'Qwen 3.8' : 'Boundless';
+}
+function heroAbout() {
+  if (FAMILY.startsWith('deepseek'))
+    return '一台 3090，一个 359 GB 的混合专家模型（每层 384 个专家，每个 token 用 6 个），所有计算都在这台机器上完成。';
+  return '一台 3090，一个 125B 参数的混合专家模型（每个 token 激活 6B），所有计算都在这台机器上完成。';
+}
+
 const $ = s => document.querySelector(s);
 const ICON_SEND = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 const ICON_STOP = '<svg width="12" height="12" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3" fill="currentColor"/></svg>';
@@ -423,7 +434,7 @@ function renderFlow() {
     const greet = h < 5 ? '夜深了' : h < 11 ? '早上好' : h < 14 ? '午安' : h < 18 ? '下午好' : '晚上好';
     flow.innerHTML = `<div id="hero"><div class="kicker">${greet} · Local intelligence</div>
       <h1>想聊点什么？<br><em>Boundless</em> 在听。</h1>
-      <p>一台 3090，一个 125B 参数的混合专家模型（每个 token 激活 6B），所有计算都在这台机器上完成。</p>
+      <p id="hero_about">${heroAbout()}</p>
       <div class="ideas">${ideas.map(([k, q], i) => `<div class="idea" style="animation-delay:${.15 + i * .07}s" data-q="${esc(q)}">
         <span class="k">${pad(i + 1)}</span><span><b>${k}</b>${esc(q)}</span><span class="arrow">→</span></div>`).join('')}</div></div>`;
     flow.querySelectorAll('.idea').forEach(el => el.onclick = () => { $('#input').value = el.dataset.q; grow(); send(); });
@@ -588,7 +599,9 @@ async function loadModels() {
     sel.value = j.state === 'loading' ? j.target : sel.dataset.touched && j.models.some(m => m.id === keep) ? keep : j.current;
     const loading = j.state === 'loading';
     $('#v_model').textContent = loading ? '切换中…' : j.current || '—';
-    $('#brand_model').textContent = 'Qwen 3.8 · ' + (j.current || 'RTX 3090');
+    FAMILY = j.family || FAMILY;
+    $('#brand_model').textContent = familyName() + ' · ' + (j.current || 'RTX 3090');
+    if ($('#hero_about')) $('#hero_about').textContent = heroAbout();
     $('#switch').disabled = loading;
     $('#model_note').textContent = loading ? '正在切换到 ' + j.target + '，约 30–60 秒……'
                                  : j.error ? '上次切换没有成功：' + j.error : NOTE_IDLE;
