@@ -71,8 +71,8 @@ if(BL_ENABLE_CUDA)
   target_link_libraries(bl_cuda PUBLIC CUDA::cudart CUDA::cublas bl_core ggml-cpu ggml-base)
 
   # the programs
-  add_library(bl_chat STATIC src/chat.cpp)
-  target_link_libraries(bl_chat PUBLIC bl_cuda bl_text)
+  add_library(bl_chat STATIC src/chat.cpp src/chat_models.cpp)
+  target_link_libraries(bl_chat PUBLIC bl_cuda bl_text bl_dsv41)
   add_executable(bl-chat tools/bl_chat.cpp)
   target_link_libraries(bl-chat PRIVATE bl_chat)
   add_library(bl_httplib STATIC ${BL_VENDOR}/cpp-httplib/httplib.cpp)

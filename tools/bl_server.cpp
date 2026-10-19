@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,12 +52,17 @@ std::string content_text(const json & c) {   // a message's content: a string, o
     return s;
 }
 
-// a model file's id: the quantization in "...GSQ-RCO-<id>-00001-of-N.gguf", else the name before "-00001-of-"
+// a model file's id: the quantization in "...GSQ-RCO-<id>-00001-of-N.gguf", else the first quantization type in the
+// name ("...-IQ2_XXS-Experts-..."), else the name before "-00001-of-"
 std::string model_id(const std::string & path) {
     const std::string f = path.substr(path.rfind('/') + 1);
     const size_t end = f.find("-00001-of-"), at = f.rfind("GSQ-RCO-", end);
     if (end == std::string::npos) return f;
-    return at == std::string::npos ? f.substr(0, end) : f.substr(at + 8, end - at - 8);
+    if (at != std::string::npos) return f.substr(at + 8, end - at - 8);
+    std::smatch m;
+    const std::string head = f.substr(0, end);
+    if (std::regex_search(head, m, std::regex("(^|-)(I?Q[0-9]_[A-Z0-9]+(_[A-Z0-9]+)?)(-|$)"))) return m[2];
+    return head;
 }
 
 struct ModelFile { std::string id, path; double gb; };
@@ -174,7 +180,7 @@ int main(int argc, char ** argv) {
     if (model.empty()) { std::fprintf(stderr, "usage: %s --model SHARD1.gguf [--host H] [--port P] [--ctx N]\n", argv[0]); return 2; }
 
     // the loaded model; replaced (under `busy`) by a switch
-    struct Loaded { std::unique_ptr<bl::Text> text; std::unique_ptr<bl::Engine> eng; std::unique_ptr<bl::Chat> chat; std::string path; };
+    struct Loaded { std::unique_ptr<bl::ChatModel> chat; std::string path; };
     Loaded cur;
     const bool fixed_name = !name.empty();
     std::mutex state_mu;   // guards the switch state below and the model's name (read without waiting for `busy`)
@@ -183,24 +189,20 @@ int main(int argc, char ** argv) {
     auto model_name = [&] { std::lock_guard<std::mutex> lk(state_mu); return name; };
     auto load = [&](const std::string & path) {   // the old one goes first: two do not fit
         cur.chat.reset();
-        cur.eng.reset();
-        cur.text.reset();
         std::fprintf(stderr, "loading %s ...\n", path.c_str());
-        cur.text = std::make_unique<bl::Text>(path);
-        cur.eng = std::make_unique<bl::Engine>(path, ctx, cache_file);
-        cur.chat = std::make_unique<bl::Chat>(*cur.eng, *cur.text, ctx);
+        cur.chat = bl::open_chat(path, ctx, cache_file);
         cur.path = path;
         std::lock_guard<std::mutex> lk(state_mu);
         current = model_id(path);
         if (!fixed_name) {
-            name = "qwen3.8-flash-" + current;
+            name = cur.chat->family() + "-" + current;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
         }
     };
     load(model);
     auto save_cache = [&] {   // after a reply (under `busy`): the next start begins with this cache
-        if (cache_file.empty() || !cur.eng) return;
-        try { cur.eng->save_cache(cache_file); } catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); }
+        if (cache_file.empty() || !cur.chat) return;
+        try { cur.chat->save_cache(cache_file); } catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); }
     };
     std::mutex busy;   // one generation (or a model switch) at a time
     std::atomic<long> seq{0};

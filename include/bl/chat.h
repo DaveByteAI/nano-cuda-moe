@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,5 +45,22 @@ private:
     int          think_end_ = -1;    // the </think> token
     std::string  session_;           // the text the session holds (fed + generated)
 };
+
+// A chat model as the programs see it, whichever engine runs it: open_chat picks by the GGUF's architecture
+// (qwen3.8's Engine + Chat, or the deepseek41 engine with its own template and host-side sampling)
+class ChatModel {
+public:
+    virtual ~ChatModel() = default;
+    virtual ChatResult reply(const std::vector<Text::Message> & messages, const ChatParams & p,
+                             const std::function<bool(const std::string &, bool)> & on_text = nullptr) = 0;
+    virtual void        reset() = 0;
+    virtual int         position() const = 0;
+    virtual std::string report() const = 0;
+    virtual std::string family() const = 0;           // a model name prefix: "qwen3.8-flash", "deepseek-v4.1-flash"
+    virtual bool        tools() const { return true; } // function calling through the template
+    virtual void        save_cache(const std::string &) {}
+};
+// cache_file: the qwen3.8 engine's --expert-cache (ignored by the others)
+std::unique_ptr<ChatModel> open_chat(const std::string & shard1, int max_ctx, const std::string & cache_file = "");
 
 }  // namespace bl
