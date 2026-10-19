@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(nano-cuda-moe-qwen38 LANGUAGES C CXX)
+project(nano-cuda-moe LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

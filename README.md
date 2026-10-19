@@ -18,7 +18,7 @@ included. Two models so far:
 | Model | Model file | Where the experts live | Decode on a 3090 + 64 GB | Branch |
 |---|---|---|---|---|
 | [**Qwen3.8-Flash-Next**](#highlights) (125B, 6B active) | 76 GB, IQ3_XXS | VRAM + RAM | **~97 tok/s** | `main` (this page) |
-| [**DeepSeek-V4.1-Flash-1017**](#deepseek-v41-flash-dsv41-branch) | 359 GB, 2-bit experts (IQ2_XXS) | VRAM + RAM + NVMe | **8-12 tok/s** (~20 on repetitive output) | [`dsv41`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41) |
+| [**DeepSeek-V4.1-Flash-1017**](#deepseek-v41-flash-dsv41-branch) | 359 GB, 2-bit experts (IQ2_XXS) | VRAM + RAM + NVMe | **8-12 tok/s** (~20 on repetitive output) | [`dsv41`](https://github.com/DaveByteAI/nano-cuda-moe/tree/dsv41) |
 
 This is the CUDA counterpart of [**nano-metal-moe-qwen36**](https://github.com/DaveByteAI/nano-metal-moe-qwen36),
 which runs Qwen3.6-35B-A3B on a 16 GB Mac mini with Metal. Both start from the same observation: a MoE model needs
@@ -87,8 +87,8 @@ the same GGUF file and inputs: decode is **50% faster here (97 vs 65 tok/s)** on
 ### 1. Build
 
 ```bash
-git clone https://github.com/DaveByteAI/nano-cuda-moe-qwen38
-cd nano-cuda-moe-qwen38
+git clone https://github.com/DaveByteAI/nano-cuda-moe
+cd nano-cuda-moe
 cmake -B build                      # downloads llama.cpp (pinned) for ggml-cpu and the tokenizer
 cmake --build build -j
 ```
@@ -150,13 +150,13 @@ fishing" works.
 `bl-chat --model SHARD1 [--ctx N] [--temp 0.7] [--top-p 0.8] [--top-k 20] [--spec 3] [--think off|low|medium|xhigh] [--system TEXT]`;
 in the chat: `/reset`, `/think low`, `/temp 0.3`, `/stats`, `/exit`.
 
-**Several GPUs (experimental)**: on the [`multi-gpu`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/multi-gpu)
+**Several GPUs (experimental)**: on the [`multi-gpu`](https://github.com/DaveByteAI/nano-cuda-moe/tree/multi-gpu)
 branch, `--gpus 0,1` splits the layers between the cards. So far checked only as two stages on one GPU, not yet on two
 real GPUs; reports are welcome.
 
 ## DeepSeek-V4.1-Flash (`dsv41` branch)
 
-The [`dsv41` branch](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41) runs [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+The [`dsv41` branch](https://github.com/DaveByteAI/nano-cuda-moe/tree/dsv41) runs [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 from acrogenesis' [IQ2_XXS GGUF](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF) on the same
 machine, with the same `bl-server` and `bl-chat`. The file is 359 GB, five times the RAM: 140 GB of 2-bit experts and
 209 GB of Engram n-gram tables. The experts live in three tiers (~1,700 in VRAM, ~5,700 in a pinned RAM pool, the rest
@@ -171,8 +171,8 @@ the experts two layers ahead are read from the disk early.
 | A 1,000-token prompt / startup | 59 s / ~40 s |
 
 Limits: 2-bit experts (answers below the official model's), context up to 16K, no tool calls. Setup, the design and
-every measurement: the branch's [README](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41#deepseek-v41-flash) and
-[optimization log](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/dsv41/docs/LOG.md).
+every measurement: the branch's [README](https://github.com/DaveByteAI/nano-cuda-moe/tree/dsv41#deepseek-v41-flash) and
+[optimization log](https://github.com/DaveByteAI/nano-cuda-moe/tree/dsv41/docs/LOG.md).
 
 ```bash
 git checkout dsv41 && cmake -B build && cmake --build build -j
