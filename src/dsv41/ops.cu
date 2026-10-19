@@ -2,6 +2,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
 
@@ -207,6 +208,88 @@ __global__ void attention_sink_k(const float * q, const float * A, const int * i
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float o = 0.f;
         for (int j = 0; j < n; ++j) o += sc[j] * key(j)[i];
+        out[static_cast<size_t>(h) * D + i] = o * inv;
+    }
+}
+
+// split-K attention for one query (flash-decoding): block (hb, c) takes heads hb*kHG .. +kHG and keys c*kKC .. +kKC,
+// reads each of its keys once for all kHG heads (K = V is shared by the heads) and writes the chunk's max, sum of
+// exponentials and unnormalised output; attn_combine_k merges the chunks with the sink. 8x less L2 traffic than a
+// block per head reading every key.
+constexpr int kHG = 8, kKC = 64;
+__global__ void attn_split_k(const float * q, const float * A, const int * idx_a, int n_a, const float * B,
+                             const int * idx_b, int n_b, int D, float scale, int S, float * om, float * ol, float * oo) {
+    extern __shared__ float sm[];
+    float * qs = sm;              // [kHG][D]
+    float * sc = sm + kHG * D;    // [kHG][kKC]
+    const int hb = blockIdx.x, c = blockIdx.y, n = n_a + n_b;
+    const int j0 = c * kKC, nk = min(kKC, n - j0);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int i = threadIdx.x; i < kHG * D; i += blockDim.x) qs[i] = q[static_cast<size_t>(hb) * kHG * D + i];
+    __syncthreads();
+    auto key = [&](int j) -> const float * {
+        return j < n_a ? A + static_cast<size_t>(idx_a[j]) * D : B + static_cast<size_t>(idx_b[j - n_a]) * D;
+    };
+    for (int jj = warp; jj < nk; jj += nw) {
+        const float * k = key(j0 + jj);
+        float acc[kHG];
+#pragma unroll
+        for (int h = 0; h < kHG; ++h) acc[h] = 0.f;
+        for (int i = lane; i < D; i += 32) {
+            const float kv = k[i];
+#pragma unroll
+            for (int h = 0; h < kHG; ++h) acc[h] += qs[h * D + i] * kv;
+        }
+#pragma unroll
+        for (int h = 0; h < kHG; ++h) acc[h] = warp_sum(acc[h]);
+        if (lane == 0)
+#pragma unroll
+            for (int h = 0; h < kHG; ++h) sc[h * kKC + jj] = acc[h] * scale;
+    }
+    __syncthreads();
+    if (warp < kHG) {   // warp h: the chunk's softmax statistics of head h
+        const int h = warp;
+        float m = -FLT_MAX;
+        for (int jj = lane; jj < nk; jj += 32) m = fmaxf(m, sc[h * kKC + jj]);
+        m = warp_max(m);
+        float l = 0.f;
+        for (int jj = lane; jj < nk; jj += 32) {
+            const float e = expf(sc[h * kKC + jj] - m);
+            sc[h * kKC + jj] = e;
+            l += e;
+        }
+        l = warp_sum(l);
+        if (lane == 0) {
+            om[(hb * kHG + h) * S + c] = m;
+            ol[(hb * kHG + h) * S + c] = l;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float o[kHG];
+#pragma unroll
+        for (int h = 0; h < kHG; ++h) o[h] = 0.f;
+        for (int jj = 0; jj < nk; ++jj) {
+            const float kv = key(j0 + jj)[i];
+#pragma unroll
+            for (int h = 0; h < kHG; ++h) o[h] += sc[h * kKC + jj] * kv;
+        }
+#pragma unroll
+        for (int h = 0; h < kHG; ++h) oo[(static_cast<size_t>(hb * kHG + h) * S + c) * D + i] = o[h];
+    }
+}
+
+__global__ void attn_combine_k(const float * om, const float * ol, const float * oo, const float * sink, float * out, int D,
+                               int S) {
+    const int h = blockIdx.x;
+    float mx = sink[h];
+    for (int c = 0; c < S; ++c) mx = fmaxf(mx, om[h * S + c]);
+    float z = expf(sink[h] - mx);
+    for (int c = 0; c < S; ++c) z += ol[h * S + c] * expf(om[h * S + c] - mx);
+    const float inv = 1.f / z;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float o = 0.f;
+        for (int c = 0; c < S; ++c) o += expf(om[h * S + c] - mx) * oo[(static_cast<size_t>(h) * S + c) * D + i];
         out[static_cast<size_t>(h) * D + i] = o * inv;
     }
 }
@@ -504,8 +587,27 @@ void engram_gate(float * R, const float * kv, const float * qk, int hc, int D, f
 
 void attention_sink(const float * q, const float * A, const int * idx_a, int n_a, const float * B, const int * idx_b,
                     int n_b, const float * sink, float * out, int H, int D, float scale, cudaStream_t s) {
-    const size_t smem = sizeof(float) * (D + n_a + n_b);
-    attention_sink_k<<<H, 256, smem, s>>>(q, A, idx_a, n_a, B, idx_b, n_b, sink, out, D, scale);
+    static const bool old = std::getenv("BL_DSV41_ATTN_OLD") != nullptr;
+    const int n = n_a + n_b;
+    if (old || H % kHG || D % 32 || n == 0) {
+        const size_t smem = sizeof(float) * (D + n_a + n_b);
+        attention_sink_k<<<H, 256, smem, s>>>(q, A, idx_a, n_a, B, idx_b, n_b, sink, out, D, scale);
+        return;
+    }
+    const int S = (n + kKC - 1) / kKC;
+    // the chunks' partial results: grown when needed, reused in stream order
+    static float * scratch = nullptr;
+    static size_t have = 0;
+    const size_t need = static_cast<size_t>(H) * S * (D + 2);
+    if (need > have) {
+        if (scratch) { cudaStreamSynchronize(s); cudaFree(scratch); }
+        if (cudaMalloc(&scratch, need * sizeof(float)) != cudaSuccess) throw std::runtime_error("attention scratch");
+        have = need;
+    }
+    float * om = scratch, * ol = scratch + static_cast<size_t>(H) * S, * oo = scratch + 2 * static_cast<size_t>(H) * S;
+    const size_t smem = sizeof(float) * (kHG * D + kHG * kKC);
+    attn_split_k<<<dim3(H / kHG, S), 256, smem, s>>>(q, A, idx_a, n_a, B, idx_b, n_b, D, scale, S, om, ol, oo);
+    attn_combine_k<<<H, 256, 0, s>>>(om, ol, oo, sink, out, D, S);
 }
 
 void pool2(const float * kv, const float * score, float * out, int D, cudaStream_t s) {

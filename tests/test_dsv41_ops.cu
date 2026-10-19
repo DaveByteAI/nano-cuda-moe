@@ -328,7 +328,7 @@ int main() {
             attention_sink(dq + static_cast<size_t>(t) * H * D, dA, dwa, na[t], dB, dib + t * 512, nb[t], dsk, o, H, D, 1.f / std::sqrt(512.f), 0);
             for (float v : host(o, H * D)) satt.push_back(v);
         }
-        check("rows attention", batt, satt, 0.f);
+        check("rows attention", batt, satt, 1e-5f);   // the one-token kernel is split-K: another summation order
     }
     {   // swiglu_clamp
         const int n = 2304;
