@@ -165,6 +165,11 @@ real GPUs; reports are welcome.
 140 GB of 2-bit experts (15,360 of them, 9.1 MB each), 7.6 GB of Q8_0 dense weights, 209 GB of Engram tables. The
 model description and the forward pass, checked against the official code: [docs/DSV41.md](docs/DSV41.md) (Chinese).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dsv41-en-dark.svg">
+  <img alt="Architecture of the DeepSeek-V4.1-Flash engine: the GPU's 24 GB hold the dense weights and a cache of 1,728 experts; about 5,700 more experts are pinned in RAM, where the CPU computes the ones the GPU does not hold; the other 7,900 experts and the Engram tables are read from the NVMe." src="docs/assets/architecture-dsv41-en-light.svg" width="100%">
+</picture>
+
 ### How it fits
 
 - **Three tiers for the experts.** VRAM keeps ~1,700 of them (LRU), a pinned RAM pool ~5,700 more (52 GB on a 64 GB

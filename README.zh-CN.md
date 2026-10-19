@@ -157,6 +157,11 @@ build/bl-server --model models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002
 （15,360 个，每个 9.1 MB）、Q8_0 的稠密权重 7.6 GB、Engram 表 209 GB。模型结构和前向计算（已对照官方代码）见
 [docs/DSV41.md](docs/DSV41.md)。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dsv41-zh-dark.svg">
+  <img alt="DeepSeek-V4.1-Flash 引擎的架构：显卡的 24 GB 里放稠密权重和 1,728 个专家的缓存；另外约 5,700 个专家锁在内存里，显卡没有的由 CPU 直接在内存里算；其余约 7,900 个专家和 Engram 表从 NVMe 读。" src="docs/assets/architecture-dsv41-zh-light.svg" width="100%">
+</picture>
+
 ### 怎么装下的
 
 - **专家分三层存。** 显存放约 1,700 个（LRU），锁页内存池再放约 5,700 个（64 GB 的机器上 52 GB），其余的在 token

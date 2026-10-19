@@ -24,6 +24,10 @@ DATA = {
     "decode_ctx": [("short", 97.2), ("32K", 82.1), ("128K", 74.8)],                       # tok/s after a prompt of
     "vram": [("cache", 17.3), ("dense", 4.1), ("mtp_kv", 1.5), ("runtime", 2.4)],        # GB of the 25.3 GB card
 }
+# DeepSeek-V4.1-Flash (src/dsv41, docs/DSV41.md): 1,728 VRAM slots x 9.12 MB; Q8_0 dense; the head BF16 -> Q8_0 at load
+DATA_DSV41 = {
+    "vram": [("cache", 15.8), ("dense", 7.6), ("head", 0.7), ("runtime", 1.2)],
+}
 
 THEMES = {
     "light": {
@@ -78,6 +82,30 @@ T = {
                    ("Decode after a long prompt", "tok/s by prompt length")],
         "names": ["Strata", "nano-cuda-moe"],
         "ctx_labels": {"short": "short"},
+
+        "dsv41": {
+            "arch_title": "DeepSeek-V4.1-Flash: a 359 GB model on a 24 GB card and 64 GB of RAM",
+            "arch_sub": "Its 15,360 experts live in three tiers. The GPU computes the ones in VRAM; the CPU computes the rest from RAM.",
+            "vram_title": "GPU · 24 GB",
+            "vram_rows": [("Expert cache", "1,728 experts, LRU"), ("Dense weights", "attention, routers, shared experts"),
+                          ("Output head", "BF16 → Q8_0 at load"), ("KV cache, runtime", "")],
+            "flow_title": "Per token, × 40 layers",
+            "flow": [("GPU", "Engram, attention", "Engram rows requested before layer 0"),
+                     ("GPU", "Router: 6 of 384 experts", "and layer i+2's top 2 read ahead from disk"),
+                     ("split",),
+                     ("GPU", "Combine, next layer", "a miss enters VRAM on its 2nd time in 1,000")],
+            "hit": ("GPU", "In VRAM", "≈ 70% of experts"),
+            "miss": ("CPU", "Not in VRAM", "≈ 30%, 8 threads"),
+            "token": "token", "next": "next token",
+            "ram_title": "RAM · 64 GB",
+            "ram_sub": "≈ 5,700 experts, pinned",
+            "ram_sub2": "52 GB, none of them also in VRAM",
+            "ssd_title": "NVMe",
+            "ssd_sub": "The other ≈ 7,900 experts",
+            "ssd_sub2": "+ the 209 GB Engram tables",
+            "ssd_reads": "≈ 13 reads / token",
+            "mtp": "Per token, 240 expert uses (6 × 40 layers): ≈ 70% from VRAM, ≈ 25% from RAM, ≈ 5% (≈ 13) read from the NVMe.",
+        },
     },
     "zh": {
         "eyebrow": "本地大模型推理  ·  NVIDIA  ·  CUDA",
@@ -116,6 +144,30 @@ T = {
                    ("长提示词之后的生成", "tok/s，按提示词长度")],
         "names": ["Strata", "nano-cuda-moe"],
         "ctx_labels": {"short": "短"},
+
+        "dsv41": {
+            "arch_title": "DeepSeek-V4.1-Flash：359 GB 的模型，24 GB 显卡 + 64 GB 内存",
+            "arch_sub": "15,360 个专家分三层存放。显存里有的由 GPU 计算，其余的由 CPU 在内存里计算。",
+            "vram_title": "显卡 · 24 GB",
+            "vram_rows": [("专家缓存", "1,728 个专家，LRU"), ("稠密权重", "注意力、路由器、共享专家"),
+                          ("输出头", "加载时 BF16 → Q8_0"), ("KV cache、运行时", "")],
+            "flow_title": "每个 token，× 40 层",
+            "flow": [("GPU", "Engram、注意力", "Engram 的行在第 0 层之前就发出读取"),
+                     ("GPU", "路由：384 个专家选 6 个", "同时提前两层从盘里预读最可能的 2 个"),
+                     ("split",),
+                     ("GPU", "合并，进入下一层", "1000 次未命中里第二次出现才放进显存")],
+            "hit": ("GPU", "显存里有", "约 70% 的专家"),
+            "miss": ("CPU", "显存里没有", "约 30%，8 个线程"),
+            "token": "token", "next": "下一个 token",
+            "ram_title": "内存 · 64 GB",
+            "ram_sub": "约 5,700 个专家，锁页",
+            "ram_sub2": "52 GB，和显存里的互不重复",
+            "ssd_title": "NVMe",
+            "ssd_sub": "其余约 7,900 个专家",
+            "ssd_sub2": "另有 209 GB 的 Engram 表",
+            "ssd_reads": "每个 token 约读 13 个",
+            "mtp": "每个 token 用 240 次专家（6 个 × 40 层）：约 70% 来自显存，约 25% 来自内存，约 5%（约 13 个）从 NVMe 读。",
+        },
     },
 }
 
@@ -237,6 +289,21 @@ def hero(c, t):
 
 
 def architecture(c, t):
+    return arch_figure(c, t, DATA["vram"],
+                       lambda c: {"cache": (c["gpu"], 1.0), "dense": (c["gpu"], c["seg"] * 0.75), "mtp_kv": (c["mem"], 1.0),
+                                  "runtime": (c["base"], c["seg"])},
+                       {"dense": -16, "mtp_kv": 2, "runtime": 18})
+
+
+def architecture_dsv41(c, t):
+    return arch_figure(c, t["dsv41"], DATA_DSV41["vram"],
+                       lambda c: {"cache": (c["gpu"], 1.0), "dense": (c["gpu"], c["seg"] * 0.75), "head": (c["mem"], 1.0),
+                                  "runtime": (c["base"], c["seg"])},
+                       {"head": -10, "runtime": 14}, ssd_to_ram=True)
+
+
+def arch_figure(c, t, vram, palette, label_dy, ssd_to_ram=False):
+    """the three tiers and one layer's flow: VRAM bar left, the flow in the middle, SSD and RAM right"""
     w, h = 1200, 680
     b = [text(48, 62, t["arch_title"], 26, c["ink"], 720),
          text(48, 90, t["arch_sub"], 15, c["ink2"], 450)]
@@ -244,24 +311,23 @@ def architecture(c, t):
     # ---- the GPU's 24 GB as a stacked bar ----
     mx, my, mw, mh = 64, 168, 60, 380
     b.append(text(48, 146, t["vram_title"], 15, c["ink"], 650))
-    total = sum(v for _, v in DATA["vram"])
-    colors = {"cache": (c["gpu"], 1.0), "dense": (c["gpu"], c["seg"] * 0.75), "mtp_kv": (c["mem"], 1.0),
-              "runtime": (c["base"], c["seg"])}
+    total = sum(v for _, v in vram)
+    colors = palette(c)
     y = my
     centers = []
-    for i, (key, gb) in enumerate(DATA["vram"]):
+    for i, (key, gb) in enumerate(vram):
         hh = mh * gb / total
         col, op = colors[key]
         top_r = 8 if i == 0 else 0
-        bot_r = 8 if i == len(DATA["vram"]) - 1 else 0
-        y0, y1 = y, y + hh - (2 if i < len(DATA["vram"]) - 1 else 0)
+        bot_r = 8 if i == len(vram) - 1 else 0
+        y0, y1 = y, y + hh - (2 if i < len(vram) - 1 else 0)
         d = (f"M{mx},{y0 + top_r} Q{mx},{y0} {mx + top_r},{y0} H{mx + mw - top_r} Q{mx + mw},{y0} {mx + mw},{y0 + top_r} "
              f"V{y1 - bot_r} Q{mx + mw},{y1} {mx + mw - bot_r},{y1} H{mx + bot_r} Q{mx},{y1} {mx},{y1 - bot_r} Z")
         b.append(f'<path d="{d}" fill="{col}" fill-opacity="{op}"/>')
         centers.append(((y0 + y1) / 2, gb))
         y += hh
-    for (name, sub), (cy, gb), key in zip(t["vram_rows"], centers, [k for k, _ in DATA["vram"]]):
-        dy = {"dense": -16, "mtp_kv": 2, "runtime": 18}.get(key, 0)
+    for (name, sub), (cy, gb), key in zip(t["vram_rows"], centers, [k for k, _ in vram]):
+        dy = label_dy.get(key, 0)
         b.append(text(mx + mw + 18, cy - 4 + dy, f"{name}", 13.5, c["ink"], 600))
         b.append(text(mx + mw + 18, cy + 14 + dy, f"{gb:.1f} GB" + (f" · {sub}" if sub else ""), 12, c["ink2"], 450))
     cache_y = centers[0][0]
@@ -313,6 +379,10 @@ def architecture(c, t):
     b.append(text(rx + 20, sy + 36, t["ssd_sub"], 15, c["ink"], 650))
     b.append(text(rx + 20, sy + 58, t["ssd_sub2"], 12.5, c["ink2"], 450))
     b.append(line(rx - 6, sy + 42, fx + fw + 8, ys[0] + fh / 2, c["ssd"], 1.6, head="ssd", dash="5 5"))
+    if ssd_to_ram:   # the experts not in RAM are read into it
+        ax = rx + rw - 36
+        b.append(line(ax, sy + 88, ax, ry - 6, c["ssd"], 1.6, head="ssd", dash="5 5"))
+        b.append(text(ax - 10, (sy + 84 + ry) / 2 + 4, t["ssd_reads"], 12, c["ink2"], 500, anchor="end"))
 
     b.append(rect(48, h - 58, w - 96, 40, c["plane"], rx=12))
     b.append(text(w / 2, h - 33, t["mtp"], 14, c["ink2"], 550, anchor="middle"))
@@ -351,7 +421,7 @@ def performance(c, t):
     return svg(w, h, "".join(b), c, t["perf_title"])
 
 
-FIGURES = {"hero": hero, "architecture": architecture, "performance": performance}
+FIGURES = {"hero": hero, "architecture": architecture, "architecture-dsv41": architecture_dsv41, "performance": performance}
 
 
 def main():
