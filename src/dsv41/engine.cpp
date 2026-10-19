@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include "bl/cpu_experts.h"
 #include "bl/cuda_ops.h"
@@ -299,6 +300,45 @@ struct Dsv41Engine::Impl {
         mats[fused] = mf;
     }
 
+    // output.weight (BF16) quantized to Q8_0 rows on the host, in slices: per 32 values d = max|x| / 127, q = round(x / d)
+    void upload_head_q8() {
+        const Tensor & t = need("output.weight");
+        if (t.type_id != 30) throw std::runtime_error("output.weight is not BF16");
+        Mat m;
+        m.type = 8;
+        m.K = static_cast<int>(t.shape[0]);
+        m.M = static_cast<int>(t.elements() / m.K);
+        if (m.K % 32) throw std::runtime_error("output.weight: rows not whole Q8_0 blocks");
+        m.row_bytes = row_bytes(8, m.K);
+        ck(cudaMalloc(&m.d, m.row_bytes * m.M), "cudaMalloc");
+        allocs.push_back(m.d);
+        const int slice = 4096;
+        std::vector<uint8_t> buf(m.row_bytes * slice);
+        for (int r0 = 0; r0 < m.M; r0 += slice) {
+            const int n = std::min(slice, m.M - r0);
+            for (int r = 0; r < n; ++r) {
+                const uint8_t * src = t.data + (static_cast<size_t>(r0 + r) * m.K) * 2;
+                uint8_t * dst = buf.data() + static_cast<size_t>(r) * m.row_bytes;
+                for (int b = 0; b < m.K / 32; ++b) {
+                    float v[32], amax = 0.f;
+                    for (int i = 0; i < 32; ++i) {
+                        uint16_t h;
+                        std::memcpy(&h, src + 2 * (b * 32 + i), 2);
+                        v[i] = bf16_to_float(h);
+                        amax = std::max(amax, std::fabs(v[i]));
+                    }
+                    const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+                    const __half hd = __float2half(d);
+                    std::memcpy(dst + b * 34, &hd, 2);
+                    for (int i = 0; i < 32; ++i) dst[b * 34 + 2 + i] = static_cast<uint8_t>(static_cast<int8_t>(std::lrintf(v[i] * id)));
+                }
+            }
+            ck(cudaMemcpy(static_cast<uint8_t *>(m.d) + static_cast<size_t>(r0) * m.row_bytes, buf.data(), m.row_bytes * n,
+                          cudaMemcpyHostToDevice), "upload");
+        }
+        mats["output.weight"] = m;
+    }
+
     std::vector<float> host_floats(const std::string & n) {
         const Tensor & t = need(n);
         std::vector<float> f(static_cast<size_t>(t.elements()));
@@ -417,7 +457,10 @@ struct Dsv41Engine::Impl {
             experts.push_back(le);
         }
         if (!engram_on) std::fprintf(stderr, "dsv41: WARNING: Engram tables missing (files 8, 9) - running WITHOUT Engram; logits will be wrong\n");
-        upload_mat("output.weight");
+        // the BF16 output head as Q8_0 by default (0.66 GB less VRAM: ~70 more expert slots; half the bytes to read each
+        // token). Against BF16 on code.tokens: mean KL 2e-5, max 1.7e-4, top-1 51/51. BL_DSV41_HEAD_Q8=0: the file's BF16
+        if (!std::getenv("BL_DSV41_HEAD_Q8") || std::atoi(std::getenv("BL_DSV41_HEAD_Q8")) != 0) upload_head_q8();
+        else upload_mat("output.weight");
         upload_vec("output_norm.weight");
         embd = need("token_embd.weight").data;
         if (need("token_embd.weight").type_id != 30) throw std::runtime_error("token_embd is not BF16");
