@@ -222,7 +222,7 @@ __global__ void attention_sink_k(const float * q, const float * A, const int * i
 // reads each of its keys once for all kHG heads (K = V is shared by the heads) and writes the chunk's max, sum of
 // exponentials and unnormalised output; attn_combine_k merges the chunks with the sink. 8x less L2 traffic than a
 // block per head reading every key.
-constexpr int kHG = 8, kKC = 64;
+constexpr int kHG = 8, kKC = 16;   // measured: 8/64 41 us, 8/32 26, 8/16 21 (split + combine), 16/16 35
 __global__ void attn_split_k(const float * q, const float * A, const int * idx_a, int n_a, const float * B,
                              const int * idx_b, int n_b, int D, float scale, int S, float * om, float * ol, float * oo) {
     extern __shared__ float sm[];
@@ -253,8 +253,7 @@ __global__ void attn_split_k(const float * q, const float * A, const int * idx_a
             for (int h = 0; h < kHG; ++h) sc[h * kKC + jj] = acc[h] * scale;
     }
     __syncthreads();
-    if (warp < kHG) {   // warp h: the chunk's softmax statistics of head h
-        const int h = warp;
+    for (int h = warp; h < kHG; h += nw) {   // warp w: the chunk's softmax statistics of heads w, w + nw, ...
         float m = -FLT_MAX;
         for (int jj = lane; jj < nk; jj += 32) m = fmaxf(m, sc[h * kKC + jj]);
         m = warp_max(m);
