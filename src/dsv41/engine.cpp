@@ -1429,7 +1429,6 @@ struct Dsv41Engine::Impl {
             cuda::dsv41::copy_small(pre, step_h + D, hc * 4, st);
             cuda::repeat(x, R, D, hc, st);
         }
-        const float eps = static_cast<float>(c.rms_eps), hc_eps = static_cast<float>(c.hc_eps);
 
         for (int il = 0; il < c.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
