@@ -112,8 +112,8 @@ struct Dsv41Engine::Impl {
     float * logit_e = nullptr, * wsel = nullptr, * gbuf = nullptr, * ubuf = nullptr, * abuf = nullptr, * ebuf = nullptr;
     float * moe = nullptr, * shx = nullptr, * ffo = nullptr;
     float * hc_ss = nullptr;   // hc_mix's sum of squares
-    uint32_t * route_h = nullptr;
-    float * logits_h = nullptr, * step_h = nullptr;   // pinned: the logits; a step's embedding row and first mix   // pinned: [0, 64) the picked ids, [64, 128) their weights, [128, 192) the prediction
+    uint32_t * route_h = nullptr;   // pinned: [0, 64) the picked ids, [64, 128) their weights, [128, 192) the prediction
+    float * logits_h = nullptr, * step_h = nullptr;   // pinned: the logits; a step's embedding row and first mix
     int * ids = nullptr, * win_idx = nullptr, * topk_idx = nullptr;
     float * emb = nullptr, * ekv = nullptr;
     uint8_t * erows = nullptr, * erows_h = nullptr;
