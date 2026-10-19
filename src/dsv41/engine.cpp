@@ -119,7 +119,12 @@ struct Dsv41Engine::Impl {
     uint8_t * erows = nullptr, * erows_h = nullptr;
     // routed experts in VRAM: an LRU cache of slots, each one expert's [gate | up | down]; misses come from the mapped
     // file (page cache or disk). BL_DSV41_CACHE_GB sets its size (default: what is free after everything else, - 0.5 GB)
-    uint8_t * xslots = nullptr;
+    // the slots live in segments of kSegSlots (so a long prefill can borrow some of them for its buffers)
+    static constexpr int kSegSlots = 64;
+    std::vector<uint8_t *> seg;
+    uint8_t * slot_ptr(int slot) const {
+        return seg[slot / kSegSlots] + static_cast<size_t>(slot % kSegSlots) * (2 * gu_expert_bytes + d_expert_bytes);
+    }
     int n_slots = 0;
     std::vector<int> slot_key;                              // (layer * n_expert + expert) held by each slot, -1 free
     std::unordered_map<int, std::list<int>::iterator> where;
@@ -223,7 +228,22 @@ struct Dsv41Engine::Impl {
     float * freq_swa = nullptr, * freq_comp = nullptr;
 
     // prefill: chunks of up to kChunk tokens through the whole model, layer by layer (weights read once per chunk)
-    static constexpr int kChunk = 64;
+    // BL_DSV41_CHUNK (default 64): a chunk's routed experts are read and copied once for all its tokens, so prefill is
+    // mostly disk and PCIe per chunk, nearly independent of the chunk's length
+    const int kChunk = std::getenv("BL_DSV41_CHUNK") ? std::max(1, std::atoi(std::getenv("BL_DSV41_CHUNK"))) : 64;
+    // a longer prompt runs as one chunk of up to BL_DSV41_PREFILL_MAX tokens (default 4096): its buffers take VRAM from
+    // the expert cache (segments freed, their experts copied back to RAM) and give it back afterwards. Each expert is
+    // then read once per layer for the whole prompt instead of once per 64 tokens (prefill is disk-bound)
+    const int pf_max = std::getenv("BL_DSV41_PREFILL_MAX") ? std::atoi(std::getenv("BL_DSV41_PREFILL_MAX")) : 4096;
+    int pf_T = 0;                     // the prefill buffers' capacity in tokens
+    std::vector<void *> pf_allocs;    // the prefill buffers (freed and reallocated with pf_T)
+    template <typename T> T * pfalloc(size_t n) {
+        void * p = nullptr;
+        ck(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)), "cudaMalloc");
+        pf_allocs.push_back(p);
+        ck(cudaMemset(p, 0, std::max<size_t>(n, 1) * sizeof(T)), "cudaMemset");
+        return static_cast<T *>(p);
+    }
     struct Pf {
         float * R, * R2, * mix, * pre, * a_pre, * post, * comb, * x, * qr, * q, * kv, * o, * og, * oa, * ao;
         float * win, * ckv, * csc, * lat, * ik, * iq, * iw, * isc, * logit_e, * w, * moe, * g, * u, * a, * sh, * ffo;
@@ -533,36 +553,7 @@ struct Dsv41Engine::Impl {
             pact = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * c.n_ff_exp);
             pout = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * D);
         }
-        {   // prefill buffers (before the expert cache, which takes the rest)
-            const size_t T = kChunk, HQ = static_cast<size_t>(H) * HD, A = T * c.n_expert_used;
-            pf.R = dalloc<float>(T * c.hc_dim()); pf.R2 = dalloc<float>(T * c.hc_dim());
-            pf.mix = dalloc<float>(T * c.hc_mix()); pf.pre = dalloc<float>(T * c.hc); pf.a_pre = dalloc<float>(T * c.hc);
-            pf.post = dalloc<float>(T * c.hc); pf.comb = dalloc<float>(T * c.hc * c.hc);
-            pf.x = dalloc<float>(T * D); pf.qr = dalloc<float>(T * c.q_lora); pf.q = dalloc<float>(T * HQ);
-            pf.kv = dalloc<float>(T * HD); pf.o = dalloc<float>(T * HQ); pf.og = dalloc<float>(T * HQ / c.o_groups);
-            pf.oa = dalloc<float>(T * c.o_groups * c.o_lora); pf.ao = dalloc<float>(T * D);
-            pf.win = dalloc<float>((T + c.window) * HD);
-            pf.ckv = dalloc<float>((T + 1) * HD); pf.csc = dalloc<float>((T + 1) * HD);
-            pf.lat = dalloc<float>(T * HD); pf.ik = dalloc<float>(T * c.idx_dim);
-            pf.iq = dalloc<float>(T * c.idx_heads * c.idx_dim); pf.iw = dalloc<float>(T * c.idx_heads);
-            pf.isc = dalloc<float>(T * static_cast<size_t>(max_ctx));
-            pf.logit_e = dalloc<float>(T * c.n_expert); pf.w = dalloc<float>(A); pf.ids = dalloc<int>(A);
-            pf.moe = dalloc<float>(T * D); pf.g = dalloc<float>(T * c.n_ff_exp); pf.u = dalloc<float>(T * c.n_ff_exp);
-            pf.a = dalloc<float>(T * c.n_ff_exp); pf.sh = dalloc<float>(T * D); pf.ffo = dalloc<float>(T * D);
-            pf.emb = dalloc<float>(T * c.engram_cols() * c.engram_dim); pf.ekv = dalloc<float>(T * (c.hc + 1) * D);
-            pf.act = dalloc<float>(A * c.n_ff_exp);
-            pf.a0 = dalloc<int>(T); pf.na = dalloc<int>(T); pf.nb = dalloc<int>(T); pf.nvis = dalloc<int>(T);
-            pf.topk = dalloc<int>(T * c.idx_top_k); pf.tok = dalloc<int>(A); pf.wa = dalloc<float>(A);
-            pf.win_ids = dalloc<int>(c.window);
-            pf.xq = dalloc<uint8_t>(cuda::q8_bytes(D) * T); pf.xg = dalloc<uint8_t>(cuda::q8_bytes(D) * A);
-            pf.actq = dalloc<uint8_t>(cuda::q8_bytes(c.n_ff_exp) * A);
-            pf.items = dalloc<cuda::MoeItem>(A);
-            pf.erows = dalloc<uint8_t>(T * c.engram_cols() * std::max<size_t>(engram_row_bytes, 1));
-            ck(cudaMallocHost(&pf.erows_h, T * c.engram_cols() * std::max<size_t>(engram_row_bytes, 1)), "pinned");
-            pf.gscratch_floats = size_t{16} << 20;   // 64 MB: gemm_w dequantizes a weight matrix into it, block by block
-            pf.gscratch = dalloc<float>(pf.gscratch_floats);
-            pf.logits = nullptr;                      // all-position logits only when asked (allocated then)
-        }
+        alloc_pf(kChunk);   // prefill buffers (before the expert cache, which takes the rest)
         // the expert cache takes the rest of VRAM
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
         size_t fr = 0, to = 0;
@@ -571,7 +562,11 @@ struct Dsv41Engine::Impl {
         size_t want = fr > (1ull << 29) ? fr - (1ull << 29) : 0;
         if (const char * e = std::getenv("BL_DSV41_CACHE_GB")) want = std::min(want, static_cast<size_t>(std::atof(e) * (1ull << 30)));
         n_slots = std::max(static_cast<int>(want / per), c.n_expert_used);
-        xslots = dalloc<uint8_t>(static_cast<size_t>(n_slots) * per);
+        for (int s0 = 0; s0 < n_slots; s0 += kSegSlots) {
+            void * d = nullptr;
+            ck(cudaMalloc(&d, static_cast<size_t>(std::min(kSegSlots, n_slots - s0)) * per), "expert cache");
+            seg.push_back(static_cast<uint8_t *>(d));
+        }
         slot_key.assign(n_slots, -1);
         ck(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking), "copy stream");
         ck(cudaStreamCreateWithFlags(&ust, cudaStreamNonBlocking), "copy stream");
@@ -609,6 +604,101 @@ struct Dsv41Engine::Impl {
     }
 
     // expert e of layer il into a VRAM slot on the copy stream (hybrid decode's admissions)
+    // the prefill buffers for chunks of up to Tn tokens
+    void alloc_pf(int Tn) {
+        const int D = c.n_embd, HD = c.head_dim, H = c.n_head;
+        const size_t T = Tn, HQ = static_cast<size_t>(H) * HD, A = T * c.n_expert_used;
+        pf.R = pfalloc<float>(T * c.hc_dim()); pf.R2 = pfalloc<float>(T * c.hc_dim());
+        pf.mix = pfalloc<float>(T * c.hc_mix()); pf.pre = pfalloc<float>(T * c.hc); pf.a_pre = pfalloc<float>(T * c.hc);
+        pf.post = pfalloc<float>(T * c.hc); pf.comb = pfalloc<float>(T * c.hc * c.hc);
+        pf.x = pfalloc<float>(T * D); pf.qr = pfalloc<float>(T * c.q_lora); pf.q = pfalloc<float>(T * HQ);
+        pf.kv = pfalloc<float>(T * HD); pf.o = pfalloc<float>(T * HQ); pf.og = pfalloc<float>(T * HQ / c.o_groups);
+        pf.oa = pfalloc<float>(T * c.o_groups * c.o_lora); pf.ao = pfalloc<float>(T * D);
+        pf.win = pfalloc<float>((T + c.window) * HD);
+        pf.ckv = pfalloc<float>((T + 1) * HD); pf.csc = pfalloc<float>((T + 1) * HD);
+        pf.lat = pfalloc<float>(T * HD); pf.ik = pfalloc<float>(T * c.idx_dim);
+        pf.iq = pfalloc<float>(T * c.idx_heads * c.idx_dim); pf.iw = pfalloc<float>(T * c.idx_heads);
+        pf.isc = pfalloc<float>(T * static_cast<size_t>(max_ctx));
+        pf.logit_e = pfalloc<float>(T * c.n_expert); pf.w = pfalloc<float>(A); pf.ids = pfalloc<int>(A);
+        pf.moe = pfalloc<float>(T * D); pf.g = pfalloc<float>(T * c.n_ff_exp); pf.u = pfalloc<float>(T * c.n_ff_exp);
+        pf.a = pfalloc<float>(T * c.n_ff_exp); pf.sh = pfalloc<float>(T * D); pf.ffo = pfalloc<float>(T * D);
+        pf.emb = pfalloc<float>(T * c.engram_cols() * c.engram_dim); pf.ekv = pfalloc<float>(T * (c.hc + 1) * D);
+        pf.act = pfalloc<float>(A * c.n_ff_exp);
+        pf.a0 = pfalloc<int>(T); pf.na = pfalloc<int>(T); pf.nb = pfalloc<int>(T); pf.nvis = pfalloc<int>(T);
+        pf.topk = pfalloc<int>(T * c.idx_top_k); pf.tok = pfalloc<int>(A); pf.wa = pfalloc<float>(A);
+        pf.win_ids = pfalloc<int>(c.window);
+        pf.xq = pfalloc<uint8_t>(cuda::q8_bytes(D) * T); pf.xg = pfalloc<uint8_t>(cuda::q8_bytes(D) * A);
+        pf.actq = pfalloc<uint8_t>(cuda::q8_bytes(c.n_ff_exp) * A);
+        pf.items = pfalloc<cuda::MoeItem>(A);
+        pf.erows = pfalloc<uint8_t>(T * c.engram_cols() * std::max<size_t>(engram_row_bytes, 1));
+        ck(cudaMallocHost(&pf.erows_h, T * c.engram_cols() * std::max<size_t>(engram_row_bytes, 1)), "pinned");
+        pf.gscratch_floats = size_t{16} << 20;   // 64 MB: gemm_w dequantizes a weight matrix into it, block by block
+        pf.gscratch = pfalloc<float>(pf.gscratch_floats);
+        pf.logits = nullptr;                      // all-position logits only when asked (allocated then)
+        pf_T = Tn;
+    }
+    void free_pf() {
+        ck(cudaStreamSynchronize(st), "prefill buffers");
+        for (void * p : pf_allocs) cudaFree(p);
+        pf_allocs.clear();
+        if (pf.erows_h) { cudaFreeHost(pf.erows_h); pf.erows_h = nullptr; }
+        pf_T = 0;
+    }
+    bool try_alloc_pf(int Tn) {
+        try {
+            alloc_pf(Tn);
+            return true;
+        } catch (const std::exception &) {
+            cudaGetLastError();
+            free_pf();
+            return false;
+        }
+    }
+
+    // the last allocated segment out of the cache: its experts copied back to RAM (exclusive tiers), its slots out of
+    // the LRU and the free list. false when none is left
+    bool drop_segment() {
+        int s = static_cast<int>(seg.size()) - 1;
+        while (s >= 0 && !seg[s]) --s;
+        if (s <= 0) return false;   // keep one
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        const int a = s * kSegSlots, b = std::min(n_slots, a + kSegSlots);
+        ck(cudaDeviceSynchronize(), "drop segment");
+        for (int slot = a; slot < b; ++slot) {
+            slot_pending[slot] = 0;
+            const int key = slot_key[slot];
+            if (key < 0) continue;
+            where.erase(key);
+            slot_key[slot] = -1;
+            if (exclusive)
+                if (uint8_t * back = ram->insert(key, nullptr)) {
+                    ck(cudaMemcpy(back, slot_ptr(slot), per, cudaMemcpyDeviceToHost), "segment back to RAM");
+                    ++demoted;
+                }
+        }
+        lru.remove_if([&](int slot) { return slot >= a && slot < b; });
+        free_vslots.erase(std::remove_if(free_vslots.begin(), free_vslots.end(), [&](int slot) { return slot >= a && slot < b; }),
+                          free_vslots.end());
+        cudaFree(seg[s]);
+        seg[s] = nullptr;
+        return true;
+    }
+    void restore_segments() {   // the dropped segments back (empty slots at the LRU tail) while VRAM allows
+        const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
+        for (size_t s = 0; s < seg.size(); ++s) {
+            if (seg[s]) continue;
+            const int a = static_cast<int>(s) * kSegSlots, b = std::min(n_slots, a + kSegSlots);
+            void * d = nullptr;
+            if (cudaMalloc(&d, static_cast<size_t>(b - a) * per) != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "dsv41: expert cache segment %zu not restored (VRAM)\n", s);
+                continue;
+            }
+            seg[s] = static_cast<uint8_t *>(d);
+            for (int slot = a; slot < b; ++slot) lru.push_back(slot);
+        }
+    }
+
     // the LRU tail out of VRAM into the free list (copied back to RAM first when exclusive)
     void free_vslot() {
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
@@ -623,7 +713,7 @@ struct Dsv41Engine::Impl {
         cudaEvent_t ev = slot_ready[slot];
         if (exclusive && old >= 0)
             if (uint8_t * back = ram->insert(old, ev)) {
-                ck(cudaMemcpyAsync(back, xslots + static_cast<size_t>(slot) * per, per, cudaMemcpyDeviceToHost, cst), "demote");
+                ck(cudaMemcpyAsync(back, slot_ptr(slot), per, cudaMemcpyDeviceToHost, cst), "demote");
                 ++demoted;
             }
         ck(cudaEventRecord(ev, cst), "event");
@@ -642,7 +732,7 @@ struct Dsv41Engine::Impl {
         const uint8_t * src = nullptr;
         ram_get(il, &e, 1, &src);
         if (slot_pending[slot]) ck(cudaStreamWaitEvent(ust, slot_ready[slot], 0), "wait demotion");
-        ck(cudaMemcpyAsync(xslots + static_cast<size_t>(slot) * per, src, per, cudaMemcpyHostToDevice, ust), "admit");
+        ck(cudaMemcpyAsync(slot_ptr(slot), src, per, cudaMemcpyHostToDevice, ust), "admit");
         ck(cudaEventRecord(slot_ready[slot], ust), "event");
         ram->drop(key, slot_ready[slot]);
         slot_pending[slot] = 1;
@@ -661,7 +751,7 @@ struct Dsv41Engine::Impl {
         where[key] = lru.begin();
         const uint8_t * src = nullptr;
         ram_get(il, &e, 1, &src);
-        uint8_t * dslot = xslots + static_cast<size_t>(slot) * per;
+        uint8_t * dslot = slot_ptr(slot);
         // the evicted expert may still be read by queued compute: the copy waits for it
         ck(cudaEventRecord(ev_compute, st), "event");
         ck(cudaStreamWaitEvent(cst, ev_compute, 0), "wait compute");
@@ -714,7 +804,7 @@ struct Dsv41Engine::Impl {
             ++hits;
             lru.splice(lru.begin(), lru, it->second);
             use_slot(*it->second);
-            return xslots + static_cast<size_t>(*it->second) * per;
+            return slot_ptr(*it->second);
         }
         ++misses;
         const int slot = lru.back();
@@ -724,7 +814,7 @@ struct Dsv41Engine::Impl {
         slot_key[slot] = key;
         lru.push_front(slot);
         where[key] = lru.begin();
-        uint8_t * dst = xslots + static_cast<size_t>(slot) * per;
+        uint8_t * dst = slot_ptr(slot);
         const uint8_t * src = nullptr;   // from the RAM tier (read from disk first if it is not there)
         ram_get(il, &e, 1, &src);
         ck(cudaMemcpyAsync(dst, src, per, cudaMemcpyHostToDevice, st), "expert");
@@ -740,6 +830,8 @@ struct Dsv41Engine::Impl {
         if (ev_compute) cudaEventDestroy(ev_compute);
         if (ev_admit) cudaEventDestroy(ev_admit);
         for (void * p : allocs) cudaFree(p);
+        for (void * p : pf_allocs) cudaFree(p);
+        for (uint8_t * p : seg) if (p) cudaFree(p);
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
         if (plan2_h) cudaFreeHost(plan2_h);
@@ -992,7 +1084,7 @@ struct Dsv41Engine::Impl {
                 lru.splice(lru.begin(), lru, it->second);
                 use_slot(*it->second);
                 gk.push_back(k);
-                gbase.push_back(xslots + static_cast<size_t>(*it->second) * (2 * gu_expert_bytes + d_expert_bytes));
+                gbase.push_back(slot_ptr(*it->second));
             } else {
                 ++misses;
                 ck_.push_back(k);
@@ -1079,7 +1171,7 @@ struct Dsv41Engine::Impl {
                 const int vs = *where.at(il * c.n_expert + e);
                 use_slot(vs);   // the compute stream waits for the copy
                 plan2_h->ids[j] = e; plan2_h->kind[j] = cuda::kHit; plan2_h->mask[j] = 1;
-                plan2_h->base[j] = xslots + static_cast<size_t>(vs) * (2 * gu_expert_bytes + d_expert_bytes);
+                plan2_h->base[j] = slot_ptr(vs);
                 plan2_h->sel[0][j] = j; plan2_h->w[0][j] = hw[ck_[j]];
             }
             t_admit += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
@@ -1422,11 +1514,24 @@ struct Dsv41Engine::Impl {
             toks.push_back(t);
         }
         const int n = static_cast<int>(prompt.size());
+        // a long prompt: one chunk of up to pf_max, its buffers in VRAM borrowed from the expert cache
+        int chunk = kChunk;
+        if (n > kChunk && pf_max > kChunk) {
+            const int want = std::min(n, pf_max);
+            free_pf();
+            int dropped = 0;
+            while (!try_alloc_pf(want))
+                if (drop_segment()) ++dropped;
+                else break;
+            if (pf_T == want) chunk = want;
+            else alloc_pf(kChunk);
+            if (dropped) std::fprintf(stderr, "dsv41: prefill chunk %d (%d cache segments lent)\n", chunk, dropped);
+        }
         if (all_out) {
             ck(cudaMalloc(reinterpret_cast<void **>(&pf.logits), static_cast<size_t>(n) * c.n_vocab * 4), "logits");
             pf_logits_from = pos_start;
         }
-        for (int i = 0; i < n; i += kChunk) prefill_chunk(pos_start + i, std::min(kChunk, n - i), all_out != nullptr);
+        for (int i = 0; i < n; i += chunk) prefill_chunk(pos_start + i, std::min(chunk, n - i), all_out != nullptr);
         if (all_out) {
             all_out->resize(static_cast<size_t>(n) * c.n_vocab);
             ck(cudaMemcpy(all_out->data(), pf.logits, all_out->size() * 4, cudaMemcpyDeviceToHost), "logits");
@@ -1435,6 +1540,11 @@ struct Dsv41Engine::Impl {
             std::copy(all_out->end() - c.n_vocab, all_out->end(), logits.begin());
         } else {
             ck(cudaMemcpy(logits.data(), logits_d, c.n_vocab * 4, cudaMemcpyDeviceToHost), "logits");
+        }
+        if (pf_T != kChunk) {   // the cache gets its segments back
+            free_pf();
+            alloc_pf(kChunk);
+            restore_segments();
         }
         t_prefill += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         n_prefill += n;
