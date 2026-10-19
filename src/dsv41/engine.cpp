@@ -117,7 +117,7 @@ struct Dsv41Engine::Impl {
     float * emb = nullptr, * ekv = nullptr;
     uint8_t * erows = nullptr, * erows_h = nullptr;
     // routed experts in VRAM: an LRU cache of slots, each one expert's [gate | up | down]; misses come from the mapped
-    // file (page cache or disk). BL_DSV41_CACHE_GB sets its size (default: what is free after everything else, - 1.5 GB)
+    // file (page cache or disk). BL_DSV41_CACHE_GB sets its size (default: what is free after everything else, - 0.5 GB)
     uint8_t * xslots = nullptr;
     int n_slots = 0;
     std::vector<int> slot_key;                              // (layer * n_expert + expert) held by each slot, -1 free
@@ -524,7 +524,8 @@ struct Dsv41Engine::Impl {
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
         size_t fr = 0, to = 0;
         ck(cudaMemGetInfo(&fr, &to), "cudaMemGetInfo");
-        size_t want = fr > (3ull << 29) ? fr - (3ull << 29) : 0;
+        // 0.5 GB left: a decode run peaks ~0.1 GB above the load (lazy scratch, prefill logits on request)
+        size_t want = fr > (1ull << 29) ? fr - (1ull << 29) : 0;
         if (const char * e = std::getenv("BL_DSV41_CACHE_GB")) want = std::min(want, static_cast<size_t>(std::atof(e) * (1ull << 30)));
         n_slots = std::max(static_cast<int>(want / per), c.n_expert_used);
         xslots = dalloc<uint8_t>(static_cast<size_t>(n_slots) * per);
