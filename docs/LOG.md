@@ -693,3 +693,31 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
   mscale；hc 系数滞后一个子层；只有 1 个 KV 头且 K = V；压缩 KV 与 indexer 只在源层计算、后面的层共用。
 - 字节预算：路由专家 140.14 GB（每 token 读 2.19 GB）、稠密加 output 8.94 GB（每 token 全读，840 GB/s 下约 10.6 ms 的下限）、
   Engram 表 208.90 GB（每 token 48 行，几乎每行一个 4 KB 页）。
+
+## 2026-10-19 dsv41：带 Engram 的解码优化（混合解码，`BL_DSV41_HYBRID=1`）
+
+- 测量方法：`bl-dsv41 --force 64` 先 prefill 64 个 token，再逐 token 喂真实文本（teacher-forced，每次运行工作量相同），
+  `bench/dsv41/real_{zh,cuda,en}.tokens` 各 512 token，统计第 128 步之后的 320 步。原来的 `code.tokens` 生成会重复（不带 Engram
+  时陷进死循环），专家复用率虚高，不再用来比速度。prefill 的 logits 每次运行有 ±0.2 的差（原子加），自由生成长了会分岔。
+- `BL_DSV41_TRACE` 记录每步每层的专家选择，`tools/dsv41_cache_sim.py` 离线重放缓存策略（与实测的 VRAM 未命中数吻合）。
+
+| 改动 | zh ms/token | 依据 |
+|---|---|---|
+| 起点（Engram 打开） | 203 | 每 token 读盘 16.7 次、每次约 8 ms |
+| IO 线程 4 → 1 | 176 | 这块 NVMe 并发多了反而慢（3 MB 块：1 线程 1.6 GB/s，4 线程 1.3） |
+| VRAM / RAM 两层互斥（进 VRAM 就移出 RAM，淘汰时拷回） | 150 | 模拟器读盘 −28%，实测 −39% |
+| 早拷入：一层 ≥2 个未命中时 1 个拷进 VRAM 由 GPU 算 + 预留空闲槽 | 141 | 这次拷贝本来就要做 |
+| 2 个 IO 线程、读拆成 1.5 MB | 137 | `tests/bench_dsv41_ram.cpp`：一个专家 3 段分给 2 线程时尾段只有 1 路 |
+| 层内流水：先算已在内存的未命中，同时等盘 | 132 | `ExpertRam::start/wait` |
+| hc_fn 每行一个 block 并顺带求平方和、wo_a 一次发射 | 129 | hc 部分每步 3.1 → 1.1 ms |
+| 小拷贝改用 kernel 读写锁页内存（不走拷贝引擎） | 116 | 路由结果、plan、CPU 输出排在 9 MB 专家拷贝后面，每层约 0.38 ms |
+| 预读第 il+2 层路由的 top-2；共享专家与 CPU 专家并行 | 112 | |
+| split-K 注意力（8 个头共用一次 key 读取） | 112.7 | 路由前 GPU 等待 14.9 → 12.5 ms（总时间被读盘波动盖住） |
+| logits 与 step 开头的上传走锁页缓冲 | **110** | |
+
+- 三段文本：zh 203 → 110、cuda 158 → 104、en 222 → 125 ms/token（约 9 tok/s）。
+- 没用的：LFU / SLRU / ARC / LRU-2 都不如 LRU（模拟）；预读 top-16 把盘塞满（257 ms）；CPU 线程 8/12/16 无差别（IQ2_XXS
+  解码算力受限，利用率 96%）；3 个 IO 线程；自适应早拷入个数；`BL_CPU_SPINS`。
+- 事故：`BL_DSV41_RAM_GB=56` 的锁页池把内存用尽，机器死机重启。现在池子最多 MemAvailable − 8 GB；默认留 12 GB
+  （运行中 MemAvailable 最低 11.4 GB）。
+- 现在的构成（zh）：等盘约 51 ms、CPU 算未命中约 30 ms、路由前 GPU 约 13 ms、GPU 收尾约 9 ms。
