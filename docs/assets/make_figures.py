@@ -44,10 +44,10 @@ T = {
     "en": {
         "eyebrow": "LOCAL LLM INFERENCE  ·  NVIDIA  ·  CUDA",
         "title": "nano-cuda-moe",
-        "subtitle": "Qwen3.8-Flash-Next on one 24 GB RTX 3090",
-        "tiles": [(f"{DATA['decode']:.0f}", "tok/s", "decode speed"), ("125B", "", "params · 6B active"),
-                  ("24 GB", "", "one RTX 3090"), ("128K", "", "context, tested")],
-        "grid_caption": "Each layer has 512 experts; a token uses 10.",
+        "subtitle": "Qwen3.8 and DeepSeek-V4.1 on one 24 GB RTX 3090",
+        "tiles": [(f"{DATA['decode']:.0f}", "tok/s", "Qwen3.8 · 125B"), ("~10", "tok/s", "DeepSeek-V4.1 · 2-bit"),
+                  ("24 GB", "", "one RTX 3090"), ("64 GB", "", "RAM")],
+        "grid_caption": "Qwen3.8: each layer has 512 experts; a token uses 10.",
         "grid_caption2": "About 9 come from the GPU cache, 1 runs on the CPU.",
 
         "arch_title": "How a 125B model runs on a 24 GB card",
@@ -82,10 +82,10 @@ T = {
     "zh": {
         "eyebrow": "本地大模型推理  ·  NVIDIA  ·  CUDA",
         "title": "nano-cuda-moe",
-        "subtitle": "一张 24 GB 的 RTX 3090 跑 Qwen3.8-Flash-Next",
-        "tiles": [(f"{DATA['decode']:.0f}", "tok/s", "生成速度"), ("125B", "", "参数 · 激活 6B"),
-                  ("24 GB", "", "一张 RTX 3090"), ("128K", "", "上下文（已测）")],
-        "grid_caption": "每层 512 个专家，每个 token 用 10 个。",
+        "subtitle": "一张 24 GB 的 RTX 3090 跑 Qwen3.8 和 DeepSeek-V4.1",
+        "tiles": [(f"{DATA['decode']:.0f}", "tok/s", "Qwen3.8 · 125B"), ("~10", "tok/s", "DeepSeek-V4.1 · 2 bit"),
+                  ("24 GB", "", "一张 RTX 3090"), ("64 GB", "", "内存")],
+        "grid_caption": "Qwen3.8：每层 512 个专家，每个 token 用 10 个。",
         "grid_caption2": "约 9 个来自显卡缓存，1 个由 CPU 计算。",
 
         "arch_title": "125B 的模型怎么跑在 24 GB 的显卡上",
