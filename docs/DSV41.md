@@ -18,7 +18,7 @@ build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16
   没有工具调用（模板里没有）。
 - 默认混合解码（`BL_DSV41_HYBRID=1`）；启动时按 `bench/dsv41/expert_profile.txt` 把最常用的专家装进 VRAM 和 RAM 层，约 35 s
   （`BL_DSV41_PROFILE=none` 跳过）。
-- 速度（3090 + 62 GB）：新内容 9–12 tok/s，重复性的输出约 20 tok/s；1K 提示词 prefill 约 17 tok/s。
+- 速度（3090 + 64 GB）：新内容 9–12 tok/s，重复性的输出约 20 tok/s；1K 提示词 prefill 约 17 tok/s。
 - 调参的环境变量（默认值都是测过的最好值）：`BL_DSV41_RAM_GB`（RAM 层大小，上限 MemAvailable − 8 GB）、`BL_DSV41_CACHE_GB`、
   `BL_DSV41_IO_THREADS`、`BL_DSV41_PREFETCH` / `_DIST`、`BL_DSV41_GHOST`、`BL_DSV41_EARLY`、`BL_DSV41_HEAD_Q8`、
   `BL_DSV41_PREFILL_MAX`。测速：`bl-dsv41 --force 64 --stats-after 128`（见 [LOG.md](LOG.md) 2026-10-19）。
@@ -173,4 +173,4 @@ h = 50% 时约 55–60 ms/token，即 ~17 tok/s，NVMe 未命中另算。
 2. 批量 prefill：稠密部分按层把 T 个 token 一起算（权重读一次），专家按"被哪些 token 选中"分组。
 3. 去掉每层一次的路由同步：GPU 自己决定命中与未命中（Qwen3.8 的 doorbell 流水线），整 token 一个 CUDA graph。
 4. 稠密部分换 4 bit 格式（显存和 10.6 ms 下限都减半），先测精度。
-5. 投机解码：DSpark 层（官方权重里有，这个 GGUF 没有）。
+5. ~~投机解码：DSpark 层~~ 测过（[LOG.md](LOG.md) 2026-10-19）：平均接受 3.25/5，但卸载时验证 6 个 token 要 8.5 步的时间，不做。

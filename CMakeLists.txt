@@ -53,6 +53,10 @@ target_link_libraries(bl-tok PRIVATE bl_text)
 add_executable(bl-mtp-pack tools/mtp_pack.cpp)
 target_include_directories(bl-mtp-pack PRIVATE ${BL_VENDOR})
 target_link_libraries(bl-mtp-pack PRIVATE ggml-base pthread)
+# DeepSeek-V4.1's DSpark draft from the official checkpoint's mtp.* shards -> GGUF
+add_executable(bl-dspark-pack tools/dspark_pack.cpp)
+target_include_directories(bl-dspark-pack PRIVATE ${BL_VENDOR})
+target_link_libraries(bl-dspark-pack PRIVATE ggml-base pthread)
 
 if(BL_ENABLE_CUDA)
   # tested on sm_86 (RTX 3090); the kernels need sm_80 or newer (mma.sync, cp.async). Other cards:

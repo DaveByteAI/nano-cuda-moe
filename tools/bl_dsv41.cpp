@@ -50,7 +50,7 @@ void usage() {
 
 int main(int argc, char ** argv) {
     std::string model, tokens_s, tokens_file, save_logits, dump_dir, filter = ".*";
-    int gen = 0, ctx = 4096, stats_after = -1, force = -1;
+    int gen = 0, ctx = 4096, stats_after = -1, force = -1, fchunk = 0;
     bool engram_rows = false, use_prefill = false, check_prefill = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -69,6 +69,7 @@ int main(int argc, char ** argv) {
         else if (a == "--engram-rows") engram_rows = true;
         else if (a == "--stats-after") stats_after = std::stoi(next());   // the report covers only the steps after N generated
         else if (a == "--force") force = std::stoi(next());
+        else if (a == "--chunk") fchunk = std::stoi(next());   // --force: the stepped tokens K at a time through prefill
         else if (a == "--prefill") use_prefill = true;          // the prompt through prefill(), then --gen steps
         else if (a == "--check-prefill") check_prefill = true;  // prefill's logits against stepping each token
         else { usage(); return 2; }
@@ -172,6 +173,20 @@ int main(int argc, char ** argv) {
             const std::vector<int> head(prompt.begin(), prompt.begin() + std::min<size_t>(force, prompt.size()));
             if (!head.empty()) eng.prefill(head);
             int agree = 0, n = 0;
+            if (fchunk > 1) {   // a verify step's cost: K tokens at once
+                double t = 0;
+                int nc = 0;
+                for (size_t i = head.size(); i + fchunk <= prompt.size(); i += fchunk, ++nc) {
+                    if (stats_after >= 0 && i == head.size() + stats_after / fchunk * fchunk) { eng.reset_stats(); t = 0; nc = 0; }
+                    const auto a = std::chrono::steady_clock::now();
+                    eng.prefill(std::vector<int>(prompt.begin() + i, prompt.begin() + i + fchunk));
+                    t += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+                }
+                std::printf("forced %d chunks of %d: %.2f ms per chunk, %.2f ms per token\n", nc, fchunk, 1e3 * t / nc,
+                            1e3 * t / nc / fchunk);
+                std::printf("%s\n", eng.report().c_str());
+                return 0;
+            }
             for (size_t i = head.size(); i < prompt.size(); ++i, ++n) {
                 if (n == stats_after) eng.reset_stats();
                 const auto & l = eng.step(prompt[i]);
