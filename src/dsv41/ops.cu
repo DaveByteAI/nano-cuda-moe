@@ -2,6 +2,8 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <stdexcept>
+#include <algorithm>
 
 namespace bl::cuda::dsv41 {
 
@@ -54,6 +56,9 @@ __global__ void rope_tail_k(float * x, int D, int n_rot, int pos, const float * 
 }
 
 // one block: the rms of the flattened stream, then one thread does the split and the Sinkhorn iterations
+__device__ void hc_split_warp(const float * m, float ss, const float * scale, const float * base, int hc, int n,
+                              float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb);
+
 __global__ void hc_split_k(const float * m, const float * R, const float * scale, const float * base, int hc, int n,
                            float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb) {
     {   // row blockIdx.x of a batch (one block per token)
@@ -64,9 +69,40 @@ __global__ void hc_split_k(const float * m, const float * R, const float * scale
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += R[i] * R[i];
     ss = block_sum(ss);
-    // warp 0, lane l = j * hc + k holds comb element (j, k) in a register (hc a power of two, hc * hc <= 32):
-    // a row's elements are hc neighbouring lanes (xor 1 .. hc/2), a column's are hc apart (xor hc .. hc*hc/2)
     if (threadIdx.x >= 32) return;
+    hc_split_warp(m, ss, scale, base, hc, n, norm_eps, hc_eps, iters, pre, post, comb);
+}
+
+// the single-token path: hc_fn_k has the mixes and the sum of squares already; one warp
+__global__ void hc_split_ss_k(const float * m, const float * ss, const float * scale, const float * base, int hc, int n,
+                              float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb) {
+    hc_split_warp(m, *ss, scale, base, hc, n, norm_eps, hc_eps, iters, pre, post, comb);
+}
+
+// m[r] = fn[r] . R (fn [M][K] fp32, K = hc * D), one block per row; block 0 also stores sum(R^2) (every block reads
+// all of R anyway). Replaces a warp-per-row matvec (24 rows: 6 blocks on the whole GPU) and hc_split's own R pass.
+__global__ void hc_fn_k(const float * __restrict__ W, int K, const float * __restrict__ R, float * m, float * ss_out) {
+    const float4 * w = reinterpret_cast<const float4 *>(W + static_cast<size_t>(blockIdx.x) * K);
+    const float4 * r = reinterpret_cast<const float4 *>(R);
+    float d = 0.f, ss = 0.f;
+    for (int i = threadIdx.x; i < K / 4; i += blockDim.x) {
+        const float4 a = w[i], b = r[i];
+        d += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        ss += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+    }
+    d = block_sum(d);
+    ss = block_sum(ss);
+    if (threadIdx.x == 0) {
+        m[blockIdx.x] = d;
+        if (blockIdx.x == 0) *ss_out = ss;
+    }
+}
+
+// warp 0 of hc_split: from the raw mixes and sum(R^2) to pre, post, comb
+__device__ void hc_split_warp(const float * m, float ss, const float * scale, const float * base, int hc, int n,
+                              float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb) {
+    // lane l = j * hc + k holds comb element (j, k) in a register (hc a power of two, hc * hc <= 32):
+    // a row's elements are hc neighbouring lanes (xor 1 .. hc/2), a column's are hc apart (xor hc .. hc*hc/2)
     const int l = threadIdx.x, j = l / hc, k = l % hc, nn = hc * hc;
     const float r = rsqrtf(ss / n + norm_eps);
     if (l < hc) {
@@ -429,6 +465,28 @@ void rope_tail(float * x, int heads, int D, int n_rot, int pos, const float * fr
 void hc_split(const float * m, const float * R, const float * scale, const float * base, int hc, int D, float norm_eps,
               float hc_eps, int iters, float * pre, float * post, float * comb, cudaStream_t s) {
     hc_split_k<<<1, 256, 0, s>>>(m, R, scale, base, hc, hc * D, norm_eps, hc_eps, iters, pre, post, comb);
+}
+
+namespace {
+__global__ void copy_k(uint32_t * __restrict__ dst, const uint32_t * __restrict__ src, size_t words) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < words; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        dst[i] = src[i];
+}
+}  // namespace
+
+void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s) {
+    if (bytes % 4) throw std::runtime_error("copy_small: not whole words");
+    const size_t w = bytes / 4;
+    if (w == 0) return;
+    const int blocks = static_cast<int>(std::min<size_t>((w + 255) / 256, 64));
+    copy_k<<<blocks, 256, 0, s>>>(static_cast<uint32_t *>(dst), static_cast<const uint32_t *>(src), w);
+}
+
+void hc_fn_split(const float * fn, int M, const float * R, const float * scale, const float * base, int hc, int D,
+                 float norm_eps, float hc_eps, int iters, float * mix, float * ss, float * pre, float * post, float * comb,
+                 cudaStream_t s) {
+    hc_fn_k<<<M, 512, 0, s>>>(fn, hc * D, R, mix, ss);
+    hc_split_ss_k<<<1, 32, 0, s>>>(mix, ss, scale, base, hc, hc * D, norm_eps, hc_eps, iters, pre, post, comb);
 }
 
 void hc_pre(const float * R, const float * pre, float * out, int hc, int D, cudaStream_t s) {

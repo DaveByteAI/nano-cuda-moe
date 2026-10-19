@@ -31,7 +31,9 @@ struct CpuExperts::Impl {
     std::atomic<int>      done{0};
     std::atomic<bool>     quit{false};
     std::atomic<int>      sleepers{0};   // workers parked in ticket.wait (idle for a while)
-    static constexpr int  kSpins = 200000;   // pause()s before an idle worker parks (~ a few hundred us)
+    // pause()s before an idle worker parks (a pause is ~140 cycles on this CPU: 200000 is ~10 ms);
+    // BL_CPU_SPINS overrides
+    const int kSpins = std::getenv("BL_CPU_SPINS") ? std::atoi(std::getenv("BL_CPU_SPINS")) : 200000;
     uint32_t              phase_id = 0;
     int                   n_tasks = 0;
     void (*fn)(Impl *, int task) = nullptr;

@@ -14,6 +14,13 @@ void rope_tail(float * x, int heads, int D, int n_rot, int pos, const float * fr
 // pre [hc], post [hc], comb [hc][hc] (comb[j][k]: residual copy j into output copy k)
 void hc_split(const float * m, const float * R, const float * scale, const float * base, int hc, int D, float norm_eps,
               float hc_eps, int iters, float * pre, float * post, float * comb, cudaStream_t s);
+// a few KB between device memory and pinned host memory (UVA: the kernel reads or writes the host pointer) by a
+// kernel, not a copy engine: a small copy then never queues behind a 9 MB expert copy on the same engine
+void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s);
+// fn . flat R (fn [M][hc*D] fp32) into mix, then hc_split from it: two launches, R read once (ss: 1 float of scratch)
+void hc_fn_split(const float * fn, int M, const float * R, const float * scale, const float * base, int hc, int D,
+                 float norm_eps, float hc_eps, int iters, float * mix, float * ss, float * pre, float * post, float * comb,
+                 cudaStream_t s);
 // out[d] = sum_j pre[j] * R[j][d]
 void hc_pre(const float * R, const float * pre, float * out, int hc, int D, cudaStream_t s);
 // out[k][d] = post[k] * h[d] + sum_j comb[j][k] * res[j][d]   (out must not alias res)

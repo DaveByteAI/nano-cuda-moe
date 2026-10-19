@@ -110,6 +110,8 @@ struct Dsv41Engine::Impl {
     float * lat = nullptr, * ik = nullptr, * iq = nullptr, * iw = nullptr, * isc = nullptr;
     float * logit_e = nullptr, * wsel = nullptr, * gbuf = nullptr, * ubuf = nullptr, * abuf = nullptr, * ebuf = nullptr;
     float * moe = nullptr, * shx = nullptr, * ffo = nullptr;
+    float * hc_ss = nullptr;   // hc_mix's sum of squares
+    uint32_t * route_h = nullptr;   // pinned: [0, 64) the picked ids, [64, 128) their weights, [128, 192) the prediction
     int * ids = nullptr, * win_idx = nullptr, * topk_idx = nullptr;
     float * emb = nullptr, * ekv = nullptr;
     uint8_t * erows = nullptr, * erows_h = nullptr;
@@ -149,7 +151,13 @@ struct Dsv41Engine::Impl {
     float * x_h = nullptr, * cpu_out_h = nullptr, * cpu_out_d = nullptr;
     double t_cpu = 0, t_gpu_wait = 0, t_ram = 0, t_router = 0, t_admit = 0;
     // host time per stretch of a decode step (launches included): engram, attention sublayer, FFN pre, moe_ffn
-    double t_host[4] = {};   // t_router: waiting for the GPU at the router
+    double t_host[4] = {};
+    // BL_DSV41_GPUTIME=1 (measurement): GPU time from the end of one layer's MoE to the next layer's router
+    bool gputime = std::getenv("BL_DSV41_GPUTIME") != nullptr;
+    cudaEvent_t ev_a = nullptr, ev_b = nullptr;
+    bool ev_a_set = false;
+    double t_gpu_pre = 0, t_span = 0;
+    std::chrono::steady_clock::time_point span0;   // t_router: waiting for the GPU at the router
     // BL_DSV41_PRED=1 (measurement): layer il+1's router on layer il's FFN input; are the misses that go to disk among
     // its picks? (prefetch candidates)
     bool pred_stats = std::getenv("BL_DSV41_PRED") && std::atoi(std::getenv("BL_DSV41_PRED")) != 0;
@@ -267,6 +275,19 @@ struct Dsv41Engine::Impl {
         const Mat & m = M(n);
         cuda::matvec(m.type, m.d, m.row_bytes, m.M, m.K, in, out, st);
     }
+    // the hyper-connection mixes of one sublayer from the stream R: fused when fn is fp32 (it is in these files)
+    void hc_mix(const std::string & fn, const std::string & scale, const std::string & base, float * pre_o, float * post_o,
+                float * comb_o) {
+        const Mat & m = M(fn);
+        const float eps = static_cast<float>(c.rms_eps), hc_eps = static_cast<float>(c.hc_eps);
+        if (m.type == 0 && m.K == c.hc * c.n_embd && m.K % 4 == 0) {
+            cuda::dsv41::hc_fn_split(static_cast<const float *>(m.d), m.M, R, V(scale), V(base), c.hc, c.n_embd, eps, hc_eps,
+                                     c.hc_sinkhorn, mix, hc_ss, pre_o, post_o, comb_o, st);
+            return;
+        }
+        mv(fn, R, mix);
+        cuda::dsv41::hc_split(mix, R, V(scale), V(base), c.hc, c.n_embd, eps, hc_eps, c.hc_sinkhorn, pre_o, post_o, comb_o, st);
+    }
     void norm(const float * in, float * out, int D, const std::string & w) {
         cuda::rmsnorm_rows(in, out, 1, D, V(w), 1, static_cast<float>(c.rms_eps), 1.f, st);
     }
@@ -355,7 +376,7 @@ struct Dsv41Engine::Impl {
 
         // state and scratch
         R = dalloc<float>(c.hc_dim()); R2 = dalloc<float>(c.hc_dim());
-        mix = dalloc<float>(c.hc_mix()); pre = dalloc<float>(c.hc); a_pre = dalloc<float>(c.hc);
+        mix = dalloc<float>(c.hc_mix()); pre = dalloc<float>(c.hc); a_pre = dalloc<float>(c.hc); hc_ss = dalloc<float>(1);
         post = dalloc<float>(c.hc); comb = dalloc<float>(c.hc * c.hc);
         x = dalloc<float>(D); qr = dalloc<float>(c.q_lora); q = dalloc<float>(static_cast<size_t>(H) * HD);
         kvt = dalloc<float>(HD); o = dalloc<float>(static_cast<size_t>(H) * HD);
@@ -402,6 +423,7 @@ struct Dsv41Engine::Impl {
             ck(cudaMallocHost(&cpu_out_h, sizeof(float) * c.n_expert_used * D), "pinned");
             cpu_out_d = dalloc<float>(static_cast<size_t>(c.n_expert_used) * D);
         }
+        ck(cudaMallocHost(&route_h, 192 * 4), "pinned");
         pred_ids_d = dalloc<int>(64); pred_w_d = dalloc<float>(64); pred_logit = dalloc<float>(c.n_expert);
         if (dp4a) {
             ck(cudaMallocHost(&plan_h, sizeof(cuda::ExpertPlan)), "pinned");
@@ -621,6 +643,7 @@ struct Dsv41Engine::Impl {
         if (erows_h) cudaFreeHost(erows_h);
         if (plan_h) cudaFreeHost(plan_h);
         if (plan2_h) cudaFreeHost(plan2_h);
+        if (route_h) cudaFreeHost(route_h);
         if (pf.erows_h) cudaFreeHost(pf.erows_h);
         ram.reset();
         for (int fd : direct_fd) if (fd >= 0) ::close(fd);
@@ -688,9 +711,8 @@ struct Dsv41Engine::Impl {
         // wo_a is block diagonal over the groups: group g's rows only see its own heads
         const Mat & wa = M(p + "attn_output_a.weight");
         const int gin = H * HD / c.o_groups;
-        for (int gi = 0; gi < c.o_groups; ++gi)
-            cuda::matvec(wa.type, static_cast<const uint8_t *>(wa.d) + wa.row_bytes * c.o_lora * gi, wa.row_bytes, c.o_lora,
-                         wa.K, o + static_cast<size_t>(gi) * gin, oa + static_cast<size_t>(gi) * c.o_lora, st);
+        if (wa.K != gin) throw std::runtime_error("attn_output_a: unexpected row length");
+        cuda::matvec_blocks(wa.type, wa.d, wa.row_bytes, c.o_lora, wa.K, c.o_groups, o, oa, st);
         P("attn_wo_a", il, oa, c.o_groups * c.o_lora);
         mv(p + "attn_output_b.weight", oa, ao);
         P("attn_out", il, ao, c.n_embd);
@@ -747,11 +769,13 @@ struct Dsv41Engine::Impl {
         const float lim = static_cast<float>(c.swiglu_limit);
         mv(p + "ffn_gate_inp.weight", x, logit_e);
         cuda::dsv41::router_topk(logit_e, V(p + "exp_probs_b.bias"), c.n_expert, K, static_cast<float>(c.expert_scale), ids, wsel, st);
-        std::vector<int> hid(K);
-        std::vector<float> hw(K);
-        const auto tr0 = std::chrono::steady_clock::now();   // (a copy into pageable memory waits for the stream)
-        ck(cudaMemcpyAsync(hid.data(), ids, K * 4, cudaMemcpyDeviceToHost, st), "ids");
-        ck(cudaMemcpyAsync(hw.data(), wsel, K * 4, cudaMemcpyDeviceToHost, st), "w");
+        if (gputime && ev_a_set) ck(cudaEventRecord(ev_b, st), "event");
+        const auto tr0 = std::chrono::steady_clock::now();
+        // into pinned buffers: a copy into pageable memory is a synchronous staged copy (~10 us each, 80 a token)
+        // through kernels into pinned memory: the copy engines may be busy with expert copies for ~1 ms
+        cuda::dsv41::copy_small(route_h, ids, K * 4, st);
+        cuda::dsv41::copy_small(route_h + 64, wsel, K * 4, st);
+        if (hybrid) cuda::dsv41::copy_small(x_h, x, D * 4, st);   // the CPU experts' input
         // the next layer's router on this layer's FFN input: the experts it will likely pick (one sync with this one's)
         std::vector<int> next_pred;
         const int nk = std::min(std::max({pred_stats ? pred_k : 0, hybrid ? prefetch_k : 0, trace ? 24 : 0}), 64);
@@ -761,9 +785,19 @@ struct Dsv41Engine::Impl {
             mv(pn + "ffn_gate_inp.weight", x, pred_logit);
             cuda::dsv41::router_topk(pred_logit, V(pn + "exp_probs_b.bias"), c.n_expert, nk, 1.f, pred_ids_d, pred_w_d, st);
             next_pred.resize(nk);
-            ck(cudaMemcpyAsync(next_pred.data(), pred_ids_d, nk * 4, cudaMemcpyDeviceToHost, st), "pred");
+            cuda::dsv41::copy_small(route_h + 128, pred_ids_d, nk * 4, st);
         }
         ck(cudaStreamSynchronize(st), "router");
+        std::vector<int> hid(reinterpret_cast<const int *>(route_h), reinterpret_cast<const int *>(route_h) + K);
+        std::vector<float> hw(reinterpret_cast<const float *>(route_h + 64), reinterpret_cast<const float *>(route_h + 64) + K);
+        if (!next_pred.empty()) std::memcpy(next_pred.data(), route_h + 128, nk * 4);
+        if (gputime && ev_a_set) {
+            float ms = 0;
+            ck(cudaEventElapsedTime(&ms, ev_a, ev_b), "elapsed");
+            t_gpu_pre += ms / 1e3;
+            t_span += std::chrono::duration<double>(std::chrono::steady_clock::now() - span0).count();
+            ev_a_set = false;
+        }
         t_router += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
         if (trace) {
             std::fprintf(trace, "%d %d:", cur_pos, il);
@@ -783,6 +817,12 @@ struct Dsv41Engine::Impl {
         if (pred_stats) pred_ids.assign(next_pred.begin(), next_pred.begin() + std::min<size_t>(pred_k, next_pred.size()));
         if (hybrid) {
             moe_hybrid(il, hid, hw, next_pred);
+            if (gputime) {
+                if (!ev_a) { ck(cudaEventCreate(&ev_a), "event"); ck(cudaEventCreate(&ev_b), "event"); }
+                ck(cudaEventRecord(ev_a, st), "event");
+                ev_a_set = true;
+                span0 = std::chrono::steady_clock::now();
+            }
             shared_and_out(il);
             return;
         }
@@ -860,7 +900,7 @@ struct Dsv41Engine::Impl {
                 plan_h->ids[i] = hid[gk[i]]; plan_h->kind[i] = cuda::kHit; plan_h->mask[i] = 1; plan_h->base[i] = gbase[i];
                 plan_h->sel[0][i] = i; plan_h->w[0][i] = hw[gk[i]];
             }
-            ck(cudaMemcpyAsync(plan_d, plan_h, sizeof *plan_h, cudaMemcpyHostToDevice, st), "plan");
+            cuda::dsv41::copy_small(plan_d, plan_h, sizeof *plan_h, st);
             cuda::quantize_q8(x, D, xq, st);
             cuda::plan_gate_up(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, xq, pact, st, lim);
             cuda::plan_down(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, pact, pout, st);
@@ -927,7 +967,7 @@ struct Dsv41Engine::Impl {
                 plan2_h->sel[0][j] = j; plan2_h->w[0][j] = hw[ck_[j]];
             }
             t_admit += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
-            ck(cudaMemcpyAsync(plan2_d, plan2_h, sizeof *plan2_h, cudaMemcpyHostToDevice, st), "plan");
+            cuda::dsv41::copy_small(plan2_d, plan2_h, sizeof *plan2_h, st);
             if (gk.empty()) cuda::quantize_q8(x, D, xq, st);
             cuda::plan_gate_up(expert_type, plan2_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, xq, pact, st, lim);
             cuda::plan_down(expert_type, plan2_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, pact, pout, st);
@@ -936,8 +976,7 @@ struct Dsv41Engine::Impl {
         }
         if (n > ng) {
             const int nc = n - ng;
-            // x was final before the router's sync; a pinned copy is a few microseconds
-            ck(cudaMemcpy(x_h, x, D * 4, cudaMemcpyDeviceToHost), "x");
+            // x_h: copied with the router's results
             std::vector<CpuExperts::Job> jobs(nc);
             for (int j = 0; j < nc; ++j) jobs[j] = {slot[ng + j], 1, cpu_out_h + static_cast<size_t>(j) * D};
             // the resident ones while the disk reads run, then the rest once they land
@@ -951,7 +990,7 @@ struct Dsv41Engine::Impl {
             }
             cpu_experts += nc;
             t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            ck(cudaMemcpyAsync(cpu_out_d, cpu_out_h, sizeof(float) * nc * D, cudaMemcpyHostToDevice, st), "cpu out");
+            cuda::dsv41::copy_small(cpu_out_d, cpu_out_h, sizeof(float) * nc * D, st);
             for (int j = 0; j < nc; ++j) cuda::axpy(moe, cpu_out_d + static_cast<size_t>(j) * D, hw[ck_[ng + j]], D, st);
             if (ng == 0) {   // admit a few: their pages are hot now, so the copies come from RAM
                 const auto ta = std::chrono::steady_clock::now();
@@ -1335,9 +1374,7 @@ struct Dsv41Engine::Impl {
             lap(0);
 
             // attention sublayer: collapses with the mix the previous sublayer made
-            mv(p + "hc_attn_fn.weight", R, mix);
-            cuda::dsv41::hc_split(mix, R, V(p + "hc_attn_scale.weight"), V(p + "hc_attn_base.weight"), hc, D, eps, hc_eps,
-                                  c.hc_sinkhorn, a_pre, post, comb, st);
+            hc_mix(p + "hc_attn_fn.weight", p + "hc_attn_scale.weight", p + "hc_attn_base.weight", a_pre, post, comb);
             cuda::dsv41::hc_pre(R, pre, x, hc, D, st);
             P("hc_attn_pre", il, x, D);
             norm(x, x, D, p + "attn_norm.weight");
@@ -1349,9 +1386,7 @@ struct Dsv41Engine::Impl {
             lap(1);
 
             // FFN sublayer: collapses with the attention's mix; its own pre goes to the next layer's attention
-            mv(p + "hc_ffn_fn.weight", R, mix);
-            cuda::dsv41::hc_split(mix, R, V(p + "hc_ffn_scale.weight"), V(p + "hc_ffn_base.weight"), hc, D, eps, hc_eps,
-                                  c.hc_sinkhorn, pre, post, comb, st);
+            hc_mix(p + "hc_ffn_fn.weight", p + "hc_ffn_scale.weight", p + "hc_ffn_base.weight", pre, post, comb);
             cuda::dsv41::hc_pre(R, a_pre, x, hc, D, st);
             P("hc_ffn_pre", il, x, D);
             norm(x, x, D, p + "ffn_norm.weight");
@@ -1390,6 +1425,7 @@ void Dsv41Engine::reset_stats() {
     auto & q = *p_;
     q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_router = q.t_admit = q.t_prefill = 0;
     for (double & t : q.t_host) t = 0;
+    q.t_gpu_pre = q.t_span = 0;
     q.n_steps = 0;
     q.n_prefill = 0;
     q.hits = q.misses = q.cpu_experts = q.demoted = q.gpu_misses = 0;
@@ -1410,7 +1446,7 @@ std::string Dsv41Engine::report() const {
     if (q.hybrid)
         os << "; GPU-computed misses " << static_cast<double>(q.gpu_misses) / ns << "/token; CPU experts " << static_cast<double>(q.cpu_experts) / ns << "/token in " << 1000.0 * q.t_cpu / ns
            << " ms (of it RAM tier / disk " << 1000.0 * q.t_ram / ns << " ms), then GPU wait " << 1000.0 * q.t_gpu_wait / ns << " ms; router wait " << 1000.0 * q.t_router / ns
-           << " ms, admissions " << 1000.0 * q.t_admit / ns << " ms; host per step: engram " << 1000.0 * q.t_host[0] / ns
+           << " ms (GPU time MoE end -> router " << 1000.0 * q.t_gpu_pre / ns << " ms, wall " << 1000.0 * q.t_span / ns << " ms), admissions " << 1000.0 * q.t_admit / ns << " ms; host per step: engram " << 1000.0 * q.t_host[0] / ns
            << " ms, attention sublayer " << 1000.0 * q.t_host[1] / ns << ", FFN pre " << 1000.0 * q.t_host[2] / ns << ", MoE + post "
            << 1000.0 * q.t_host[3] / ns << " ms";
     if (q.pred_stats)
