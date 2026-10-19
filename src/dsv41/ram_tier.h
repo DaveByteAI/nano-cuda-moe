@@ -54,6 +54,11 @@ public:
     // forgets `key` (it moved into VRAM); its slot is the next to reuse once `ready` (the copy out of it) completes
     void drop(int key, cudaEvent_t ready);
 
+    // freeze(true, n): reads stop displacing the resident experts; they go to at most n transient slots, reused oldest
+    // first (a cyclic scan larger than the pool - every layer of a long prefill - is LRU's worst case: it evicts
+    // exactly what comes next). n must exceed the keys of one fetch.
+    void freeze(bool on, int transient = 512);
+
     // statistics
     uint64_t hits = 0, reads = 0;            // fetch: found resident / read on demand
     uint64_t prefetched = 0, prefetch_used = 0, prefetch_waits = 0;   // prefetch reads / later fetched / fetched in flight
@@ -72,6 +77,9 @@ private:
     std::vector<char> pf_;    // per slot: filled by a prefetch, not fetched since
     std::vector<cudaEvent_t> hold_;   // per slot: the device copy it waits for (nullptr: none)
     std::list<int>    lru_;   // slots, most recently used first
+    bool              frozen_ = false;
+    int               tr_max_ = 0;
+    std::list<int>    tr_;    // frozen: the transient slots, oldest first
     std::unordered_map<int, std::list<int>::iterator> where_;
     std::unique_ptr<Io> io_;
 };

@@ -190,14 +190,33 @@ bool ExpertRam::held(int slot) {
 }
 
 int ExpertRam::victim() {
+    if (frozen_ && static_cast<int>(tr_.size()) >= tr_max_)   // recycle the oldest idle transient slot
+        for (auto t = tr_.begin(); t != tr_.end(); ++t) {
+            const int slot = *t;
+            if (io_->busy(slot) || held(slot)) continue;
+            tr_.erase(t);
+            if (key_[slot] >= 0) {
+                lru_.erase(where_.at(key_[slot]));
+                where_.erase(key_[slot]);
+            } else {
+                lru_.remove(slot);
+            }
+            key_[slot] = -1;
+            pf_[slot] = 0;
+            hold_[slot] = nullptr;
+            tr_.push_back(slot);
+            return slot;
+        }
     for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
         if (io_->busy(*it) || held(*it)) continue;   // a prefetch still filling it / a device copy using it
         const int slot = *it;
         lru_.erase(std::next(it).base());
-        if (key_[slot] >= 0) where_.erase(key_[slot]);
+        const bool was_free = key_[slot] < 0;
+        if (!was_free) where_.erase(key_[slot]);
         key_[slot] = -1;
         pf_[slot] = 0;
         hold_[slot] = nullptr;
+        if (frozen_ && !was_free) tr_.push_back(slot);   // a free slot is simply filled (a cold pool fills up as usual)
         return slot;
     }
     throw std::runtime_error("RAM tier: every slot has a read in flight");
@@ -302,6 +321,16 @@ void ExpertRam::drop(int key, cudaEvent_t ready) {
     pf_[slot] = 0;
     hold_[slot] = ready;
     lru_.push_back(slot);
+}
+
+}  // namespace bl
+
+namespace bl {
+
+void ExpertRam::freeze(bool on, int transient) {
+    frozen_ = on;
+    tr_max_ = transient;
+    tr_.clear();
 }
 
 }  // namespace bl

@@ -1527,6 +1527,10 @@ struct Dsv41Engine::Impl {
             else alloc_pf(kChunk);
             if (dropped) std::fprintf(stderr, "dsv41: prefill chunk %d (%d cache segments lent)\n", chunk, dropped);
         }
+        // a chunk touching nearly all experts of each layer scans the whole model: keep the RAM tier as it is and let
+        // the reads pass through transient slots (BL_DSV41_PF_FREEZE=0: plain LRU)
+        const bool freeze = chunk >= 128 && (!std::getenv("BL_DSV41_PF_FREEZE") || std::atoi(std::getenv("BL_DSV41_PF_FREEZE")) != 0);
+        if (freeze) ram->freeze(true, 2 * c.n_expert);
         if (all_out) {
             ck(cudaMalloc(reinterpret_cast<void **>(&pf.logits), static_cast<size_t>(n) * c.n_vocab * 4), "logits");
             pf_logits_from = pos_start;
@@ -1541,6 +1545,7 @@ struct Dsv41Engine::Impl {
         } else {
             ck(cudaMemcpy(logits.data(), logits_d, c.n_vocab * 4, cudaMemcpyDeviceToHost), "logits");
         }
+        if (freeze) ram->freeze(false);
         if (pf_T != kChunk) {   // the cache gets its segments back
             free_pf();
             alloc_pf(kChunk);
