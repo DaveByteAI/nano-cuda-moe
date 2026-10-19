@@ -28,18 +28,18 @@ constexpr size_t kPinChunk = size_t{1} << 30;
 // a fixed pool of threads, each with an aligned bounce buffer: a task reads the aligned superset of one part into
 // it and copies the wanted bytes into the slot. Two queues: demanded reads go first, prefetches when none is waiting.
 struct ExpertRam::Io {
-    struct Task { int fd; uint64_t off; size_t len; uint8_t * dst; int slot; };
+    struct Task { int fd; uint64_t off; size_t len; uint8_t * dst; int slot; bool gu; };   // gu: of the gate or up part
     std::vector<std::thread> threads;
     std::mutex mu;
     std::condition_variable cv, done_cv;
     std::deque<Task> demand, background;
-    std::vector<int> inflight;   // per slot: tasks queued or running
+    std::vector<int> inflight, inflight_gu;   // per slot: tasks queued or running (all / of the gate and up parts)
     bool   quit = false;
     std::string error;
     size_t bounce_bytes;
 
     Io(int n, size_t max_part, int n_slots)
-        : inflight(n_slots, 0), bounce_bytes((max_part + 2 * kAlign + kAlign - 1) / kAlign * kAlign) {
+        : inflight(n_slots, 0), inflight_gu(n_slots, 0), bounce_bytes((max_part + 2 * kAlign + kAlign - 1) / kAlign * kAlign) {
         for (int i = 0; i < n; ++i) threads.emplace_back([this] { loop(); });
     }
     ~Io() {
@@ -81,6 +81,7 @@ struct ExpertRam::Io {
             {
                 std::lock_guard<std::mutex> lk(mu);
                 if (!err.empty() && error.empty()) error = err;
+                if (t.gu && --inflight_gu[t.slot] == 0) done_cv.notify_all();
                 if (--inflight[t.slot] == 0) done_cv.notify_all();
             }
         }
@@ -92,6 +93,7 @@ struct ExpertRam::Io {
             std::lock_guard<std::mutex> lk(mu);
             for (const Task & t : tasks) {
                 ++inflight[t.slot];
+                if (t.gu) ++inflight_gu[t.slot];
                 (bg ? background : demand).push_back(t);
             }
         }
@@ -115,10 +117,11 @@ struct ExpertRam::Io {
         }
         if (moved) cv.notify_all();
     }
-    void wait(const std::vector<int> & slots) {
+    void wait(const std::vector<int> & slots, bool gate_up_only = false) {
+        const std::vector<int> & cnt = gate_up_only ? inflight_gu : inflight;
         std::unique_lock<std::mutex> lk(mu);
         done_cv.wait(lk, [&] {
-            for (int s : slots) if (inflight[s]) return false;
+            for (int s : slots) if (cnt[s]) return false;
             return true;
         });
         if (!error.empty()) {
@@ -172,9 +175,9 @@ ExpertRam::~ExpertRam() {
 }
 
 // one part as reads of at most chunk_bytes_ each (so two threads stay busy to the end of one expert)
-template <typename V> void ExpertRam::add_tasks(V & tasks, int fd, uint64_t off, size_t len, uint8_t * dst, int slot) {
+template <typename V> void ExpertRam::add_tasks(V & tasks, int fd, uint64_t off, size_t len, uint8_t * dst, int slot, bool gu) {
     const size_t ch = chunk_bytes_ ? chunk_bytes_ : len;
-    for (size_t o = 0; o < len; o += ch) tasks.push_back({fd, off + o, std::min(ch, len - o), dst + o, slot});
+    for (size_t o = 0; o < len; o += ch) tasks.push_back({fd, off + o, std::min(ch, len - o), dst + o, slot, gu});
 }
 
 bool ExpertRam::held(int slot) {
@@ -207,7 +210,7 @@ void ExpertRam::fetch(const int * keys, const Src * src, int n_keys, const uint8
     wait(slots.data(), n_keys);
 }
 
-void ExpertRam::wait(const int * slot, int n) {
+void ExpertRam::wait(const int * slot, int n, bool gate_up_only) {
     std::vector<int> slots(slot, slot + n);
     for (int s : slots)
         if (hold_[s]) {   // filled by a device copy still running
@@ -215,7 +218,7 @@ void ExpertRam::wait(const int * slot, int n) {
             hold_[s] = nullptr;
         }
     const auto t0 = std::chrono::steady_clock::now();
-    io_->wait(slots);
+    io_->wait(slots, gate_up_only);
     read_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
@@ -245,7 +248,7 @@ void ExpertRam::start(const int * keys, const Src * src, int n_keys, const uint8
         out[i] = dst;
         size_t o = 0;
         for (int k = 0; k < 3; ++k) {
-            add_tasks(tasks, src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot);
+            add_tasks(tasks, src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot, k < 2);
             o += src[i].len[k];
         }
         ++reads;
@@ -267,7 +270,7 @@ void ExpertRam::prefetch(const int * keys, const Src * src, int n_keys) {
         uint8_t * dst = pool_ + static_cast<size_t>(slot) * per_;
         size_t o = 0;
         for (int k = 0; k < 3; ++k) {
-            add_tasks(tasks, src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot);
+            add_tasks(tasks, src[i].fd[k], src[i].off[k], src[i].len[k], dst + o, slot, k < 2);
             o += src[i].len[k];
         }
         ++prefetched;

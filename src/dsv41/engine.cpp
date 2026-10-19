@@ -1050,11 +1050,16 @@ struct Dsv41Engine::Impl {
             // the resident ones while the disk reads run, then the rest once they land
             const int n1 = std::max(nready - ng, 0);
             cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data(), n1, lim);
-            if (n1 < nc) {
-                const auto tw = std::chrono::steady_clock::now();
-                ram->wait(rslot.data() + ng + n1, nc - n1);
-                t_ram += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
-                cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data() + n1, nc - n1, lim);
+            if (n1 < nc) {   // from disk: gate/up as soon as those parts are in, down after its part lands
+                const int * rs = rslot.data() + ng + n1;
+                auto timed_wait = [&](bool gu_only) {
+                    const auto tw = std::chrono::steady_clock::now();
+                    ram->wait(rs, nc - n1, gu_only);
+                    t_ram += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+                };
+                timed_wait(true);
+                cpu->run(expert_type, expert_type, gu_expert_bytes, F, D, x_h, 1, jobs.data() + n1, nc - n1, lim,
+                         [&] { timed_wait(false); });
             }
             cpu_experts += nc;
             t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

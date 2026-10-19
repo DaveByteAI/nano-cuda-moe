@@ -210,7 +210,7 @@ const char * CpuExperts::type_name(uint32_t type) {
 }
 
 void CpuExperts::run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, int D, const float * x, int T, const Job * jobs,
-                     int n, float swiglu_limit) {
+                     int n, float swiglu_limit, const std::function<void()> & before_down) {
     if (n == 0) return;
     Impl & I = *p_;
     I.limit = swiglu_limit;
@@ -250,6 +250,7 @@ void CpuExperts::run(uint32_t type_gu, uint32_t type_d, size_t gu_bytes, int F, 
     I.cur_ph = 2;
     I.phase(n * T, &Impl::quant_act_task);
     const auto t3 = clk::now();
+    if (before_down) before_down();
     I.cur_ph = 3;
     I.phase(n * (D / Impl::kDownRows), &Impl::down_task);
     I.cur_ph = 0;
