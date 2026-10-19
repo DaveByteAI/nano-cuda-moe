@@ -551,11 +551,45 @@ void hc_split(const float * m, const float * R, const float * scale, const float
 }
 
 namespace {
+// one row per block, 1024 threads, float4 (the shared rmsnorm_rows: 256 threads, 20 dependent loads each on a 5120 row)
+__global__ void rmsnorm1_k(const float * x0, float * y0, int D0, const float * w0, const float * x1, float * y1, int D1,
+                           const float * w1, float eps) {
+    const float * x = blockIdx.x ? x1 : x0;
+    float * y = blockIdx.x ? y1 : y0;
+    const float * w = blockIdx.x ? w1 : w0;
+    const int D = blockIdx.x ? D1 : D0;
+    const float4 * x4 = reinterpret_cast<const float4 *>(x);
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < D / 4; i += blockDim.x) {
+        const float4 v = x4[i];
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    ss = block_sum(ss);
+    const float sc = rsqrtf(ss / D + eps);
+    const float4 * w4 = reinterpret_cast<const float4 *>(w);
+    float4 * y4 = reinterpret_cast<float4 *>(y);
+    for (int i = threadIdx.x; i < D / 4; i += blockDim.x) {
+        const float4 v = x4[i], g = w4[i];
+        y4[i] = make_float4(v.x * sc * g.x, v.y * sc * g.y, v.z * sc * g.z, v.w * sc * g.w);
+    }
+}
+
 __global__ void copy_k(uint32_t * __restrict__ dst, const uint32_t * __restrict__ src, size_t words) {
     for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < words; i += static_cast<size_t>(gridDim.x) * blockDim.x)
         dst[i] = src[i];
 }
 }  // namespace
+
+void rmsnorm(const float * x, float * y, int D, const float * w, float eps, cudaStream_t s) {
+    if (D % 4) throw std::runtime_error("rmsnorm: D not a multiple of 4");
+    rmsnorm1_k<<<1, 1024, 0, s>>>(x, y, D, w, x, y, D, w, eps);
+}
+
+void rmsnorm2(const float * x0, float * y0, int D0, const float * w0, const float * x1, float * y1, int D1, const float * w1,
+              float eps, cudaStream_t s) {
+    if (D0 % 4 || D1 % 4) throw std::runtime_error("rmsnorm2: D not a multiple of 4");
+    rmsnorm1_k<<<2, 1024, 0, s>>>(x0, y0, D0, w0, x1, y1, D1, w1, eps);
+}
 
 void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s) {
     if (bytes % 4) throw std::runtime_error("copy_small: not whole words");

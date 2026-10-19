@@ -339,7 +339,7 @@ struct Dsv41Engine::Impl {
         cuda::dsv41::hc_split(mix, R, V(scale), V(base), c.hc, c.n_embd, eps, hc_eps, c.hc_sinkhorn, pre_o, post_o, comb_o, st);
     }
     void norm(const float * in, float * out, int D, const std::string & w) {
-        cuda::rmsnorm_rows(in, out, 1, D, V(w), 1, static_cast<float>(c.rms_eps), 1.f, st);
+        cuda::dsv41::rmsnorm(in, out, D, V(w), static_cast<float>(c.rms_eps), st);
     }
     void P(const std::string & name, int il, const float * d, int n) {
         if (!probe) return;
@@ -738,13 +738,14 @@ struct Dsv41Engine::Impl {
         const float * freq = ratio ? freq_comp : freq_swa;
 
         mv(p + "attn_qkv_a.fused", x, qr);   // qr and kvt
-        norm(qr, qr, c.q_lora, p + "attn_q_a_norm.weight");
+        cuda::dsv41::rmsnorm2(qr, qr, c.q_lora, V(p + "attn_q_a_norm.weight"), kvt, kvt, HD, V(p + "attn_kv_a_norm.weight"),
+                              static_cast<float>(c.rms_eps), st);
         P("qr", il, qr, c.q_lora);
         mv(p + "attn_q_b.weight", qr, q);
         cuda::dsv41::rope_tail(q, H, HD, rd, pos, freq, false, st);
         P("q", il, q, H * HD);
 
-        norm(kvt, kvt, HD, p + "attn_kv_a_norm.weight");
+
         cuda::dsv41::rope_tail(kvt, 1, HD, rd, pos, freq, false, st);
         P("kv", il, kvt, HD);
         ck(cudaMemcpyAsync(win[il] + static_cast<size_t>(pos % c.window) * HD, kvt, HD * 4, cudaMemcpyDeviceToDevice, st), "window");

@@ -14,6 +14,10 @@ void rope_tail(float * x, int heads, int D, int n_rot, int pos, const float * fr
 // pre [hc], post [hc], comb [hc][hc] (comb[j][k]: residual copy j into output copy k)
 void hc_split(const float * m, const float * R, const float * scale, const float * base, int hc, int D, float norm_eps,
               float hc_eps, int iters, float * pre, float * post, float * comb, cudaStream_t s);
+// y = x / rms(x) * w for one row of D (float4-aligned); rmsnorm2: two independent rows in one launch
+void rmsnorm(const float * x, float * y, int D, const float * w, float eps, cudaStream_t s);
+void rmsnorm2(const float * x0, float * y0, int D0, const float * w0, const float * x1, float * y1, int D1, const float * w1,
+              float eps, cudaStream_t s);
 // a few KB between device memory and pinned host memory (UVA: the kernel reads or writes the host pointer) by a
 // kernel, not a copy engine: a small copy then never queues behind a 9 MB expert copy on the same engine
 void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s);
