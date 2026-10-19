@@ -58,6 +58,7 @@ __global__ void matvec_k(const uint8_t * __restrict__ W, size_t row_bytes, int M
     const uint8_t * row = W + static_cast<size_t>(r) * row_bytes;
     const int n_groups = K / 8;
     float acc = 0.f;
+#pragma unroll 4
     for (int gg = lane; gg < n_groups; gg += 32) {
         const int blk = gg / Grp<T>::groups, g = gg % Grp<T>::groups;
         float v[8];

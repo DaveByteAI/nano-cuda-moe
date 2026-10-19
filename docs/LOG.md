@@ -713,10 +713,16 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 | 小拷贝改用 kernel 读写锁页内存（不走拷贝引擎） | 116 | 路由结果、plan、CPU 输出排在 9 MB 专家拷贝后面，每层约 0.38 ms |
 | 预读第 il+2 层路由的 top-2；共享专家与 CPU 专家并行 | 112 | |
 | split-K 注意力（8 个头共用一次 key 读取） | 112.7 | 路由前 GPU 等待 14.9 → 12.5 ms（总时间被读盘波动盖住） |
-| logits 与 step 开头的上传走锁页缓冲 | **110** | |
+| logits 与 step 开头的上传走锁页缓冲 | 110 | |
+| q_a+kv、共享专家 gate+up 各合成一次发射（同一块分配，不复制） | 109.9 | 显存碎片少了，缓存多 13 个槽 |
+| 准入过滤：一个专家在最近 1000 次未命中里第二次出现才进 VRAM | **106.3** | 每次拷入 = 9 MB 上 + 9 MB 回，占 PCIe 和内存带宽；回拷减半 |
 
-- 三段文本：zh 203 → 110、cuda 158 → 104、en 222 → 125 ms/token（约 9 tok/s）。
-- 没用的：LFU / SLRU / ARC / LRU-2 都不如 LRU（模拟）；预读 top-16 把盘塞满（257 ms）；CPU 线程 8/12/16 无差别（IQ2_XXS
+- 三段文本：zh 203 → 106、cuda 158 → 96、en 222 → 113 ms/token（9–10 tok/s）。
+- CPU 专家：IQ2_XXS 在 K = 5120 上每线程 3.1 GB/s，冷热数据一样，线程数线性（`tests/bench_dsv41_cpu.cpp`），是解码算力的
+  上限，不是内存；gather 取码本没有变化。`bench_cpu` 的尺寸是 Qwen 的，对这个模型的数字不能用。
+- 没用的：直接 O_DIRECT 读进槽位（去掉中转 memcpy，中转缓冲本来就在 L3）；把一部分未命中经临时槽交给 GPU
+  （按 0.77 / 0.49 ms 的代价平衡也一样：拷贝串行，GPU 端等待抵掉 CPU 的节省）；x 放 shared memory 的 matvec（更慢）；
+  LFU / SLRU / ARC / LRU-2 都不如 LRU（模拟）；预读 top-16 把盘塞满（257 ms）；CPU 线程 8/12/16 无差别（IQ2_XXS
   解码算力受限，利用率 96%）；3 个 IO 线程；自适应早拷入个数；`BL_CPU_SPINS`。
 - 事故：`BL_DSV41_RAM_GB=56` 的锁页池把内存用尽，机器死机重启。现在池子最多 MemAvailable − 8 GB；默认留 12 GB
   （运行中 MemAvailable 最低 11.4 GB）。
