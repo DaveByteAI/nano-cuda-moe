@@ -141,6 +141,19 @@ fishing" works.
 `bl-chat --model SHARD1 [--ctx N] [--temp 0.7] [--top-p 0.8] [--top-k 20] [--spec 3] [--think off|low|medium|xhigh] [--system TEXT]`;
 in the chat: `/reset`, `/think low`, `/temp 0.3`, `/stats`, `/exit`.
 
+**DeepSeek-V4.1-Flash** (`dsv41` branch; [docs/DSV41.md](docs/DSV41.md)): the same `bl-chat` and `bl-server` run
+acrogenesis' `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram` GGUF (10 files, 359 GB, the Engram tables
+included; `scripts/download_dsv41.sh`), picked by the file's architecture:
+
+```bash
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 32k
+```
+
+Its 140 GB of experts live in three tiers (VRAM, a pinned RAM pool, the NVMe), so the first ~40 s go to warming the
+first two from `bench/dsv41/expert_profile.txt` (`BL_DSV41_PROFILE=none` skips it). On a 3090 + 62 GB RAM it decodes
+9-12 tokens/s on new text and ~20 on repetitive output, and prefills ~17 tokens/s on a 1K prompt. The template has
+no tool calls; thinking (`--think` / `enable_thinking`) uses the release's `<think>` prompt.
+
 **Several GPUs (experimental)**: on the [`multi-gpu`](https://github.com/DaveByteAI/nano-cuda-moe-qwen38/tree/multi-gpu)
 branch, `--gpus 0,1` splits the layers between the cards. So far checked only as two stages on one GPU, not yet on two
 real GPUs; reports are welcome.

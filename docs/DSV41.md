@@ -6,6 +6,23 @@ boundless `dsv41` 分支的实现依据。来源：
 - 数学依据：官方 `inference/model.py`、`kernel.py`、`engram.py`（HF 仓库 `deepseek-ai/DeepSeek-V4.1-Flash-1017`）
 - 数值参照：llama.cpp PR #28696（vcruz305/llama.cpp `2076412`）的 `src/models/deepseek41.cpp` 和 `deepseek4.cpp`
 
+## 使用
+
+```bash
+build/bl-chat   --model ../models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 8192
+build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 32k --port 8080     # OpenAI 接口 + 网页
+```
+
+- 两个程序按 GGUF 的架构名自动选引擎（`bl::open_chat`）。分词用 libllama（架构名不认识时用只有元数据的临时副本加载词表，
+  `joyai-llm` 预分词器），模板照 GGUF 里的 `tokenizer.chat_template` 写成 C++；思考模式用官方的 `<｜Assistant｜><think>`。
+  没有工具调用（模板里没有）。
+- 默认混合解码（`BL_DSV41_HYBRID=1`）；启动时按 `bench/dsv41/expert_profile.txt` 把最常用的专家装进 VRAM 和 RAM 层，约 35 s
+  （`BL_DSV41_PROFILE=none` 跳过）。
+- 速度（3090 + 62 GB）：新内容 9–12 tok/s，重复性的输出约 20 tok/s；1K 提示词 prefill 约 17 tok/s。
+- 调参的环境变量（默认值都是测过的最好值）：`BL_DSV41_RAM_GB`（RAM 层大小，上限 MemAvailable − 8 GB）、`BL_DSV41_CACHE_GB`、
+  `BL_DSV41_IO_THREADS`、`BL_DSV41_PREFETCH` / `_DIST`、`BL_DSV41_GHOST`、`BL_DSV41_EARLY`、`BL_DSV41_HEAD_Q8`、
+  `BL_DSV41_PREFILL_MAX`。测速：`bl-dsv41 --force 64 --stats-after 128`（见 [LOG.md](LOG.md) 2026-10-19）。
+
 ## 超参数
 
 | 项目 | 值 |
