@@ -252,6 +252,32 @@ struct Dsv41Engine::Impl {
         mats[n] = m;
     }
 
+    // a then b in one allocation (same format and row length): mats[a], mats[b] and mats[fused] = both stacked
+    void upload_pair(const std::string & a, const std::string & b, const std::string & fused) {
+        const Tensor & ta = need(a), & tb = need(b);
+        Mat ma, mb;
+        for (auto [t, m] : {std::pair<const Tensor *, Mat *>{&ta, &ma}, {&tb, &mb}}) {
+            m->type = t->type_id;
+            m->K = static_cast<int>(t->shape[0]);
+            m->M = static_cast<int>(t->elements() / m->K);
+            m->row_bytes = row_bytes(t->type_id, m->K);
+            if (!cuda::supported(m->type)) throw std::runtime_error(a + ": unsupported type");
+        }
+        if (ma.type != mb.type || ma.K != mb.K) throw std::runtime_error(a + " / " + b + ": cannot share a launch");
+        void * d = nullptr;
+        ck(cudaMalloc(&d, ta.nbytes + tb.nbytes), "cudaMalloc");
+        allocs.push_back(d);
+        ck(cudaMemcpy(d, ta.data, ta.nbytes, cudaMemcpyHostToDevice), "upload");
+        ck(cudaMemcpy(static_cast<uint8_t *>(d) + ta.nbytes, tb.data, tb.nbytes, cudaMemcpyHostToDevice), "upload");
+        ma.d = d;
+        mb.d = static_cast<uint8_t *>(d) + ta.nbytes;
+        Mat mf = ma;
+        mf.M = ma.M + mb.M;
+        mats[a] = ma;
+        mats[b] = mb;
+        mats[fused] = mf;
+    }
+
     std::vector<float> host_floats(const std::string & n) {
         const Tensor & t = need(n);
         std::vector<float> f(static_cast<size_t>(t.elements()));
@@ -308,8 +334,11 @@ struct Dsv41Engine::Impl {
         // dense weights
         for (int il = 0; il < c.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
-            for (const char * n : {"attn_q_a", "attn_q_b", "attn_kv", "attn_output_a", "attn_output_b", "hc_attn_fn",
-                                   "hc_ffn_fn", "ffn_gate_inp", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"})
+            // the pairs that read the same input share one allocation: each is a slice of a fused matrix (one launch)
+            upload_pair(p + "attn_q_a.weight", p + "attn_kv.weight", p + "attn_qkv_a.fused");
+            upload_pair(p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight", p + "ffn_gate_up_shexp.fused");
+            for (const char * n : {"attn_q_b", "attn_output_a", "attn_output_b", "hc_attn_fn", "hc_ffn_fn", "ffn_gate_inp",
+                                   "ffn_down_shexp"})
                 upload_mat(p + n + ".weight");
             for (const char * n : {"attn_norm.weight", "ffn_norm.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
                                    "attn_sinks.weight", "hc_attn_base.weight", "hc_attn_scale.weight", "hc_ffn_base.weight",
@@ -381,14 +410,15 @@ struct Dsv41Engine::Impl {
         R = dalloc<float>(c.hc_dim()); R2 = dalloc<float>(c.hc_dim());
         mix = dalloc<float>(c.hc_mix()); pre = dalloc<float>(c.hc); a_pre = dalloc<float>(c.hc); hc_ss = dalloc<float>(1);
         post = dalloc<float>(c.hc); comb = dalloc<float>(c.hc * c.hc);
-        x = dalloc<float>(D); qr = dalloc<float>(c.q_lora); q = dalloc<float>(static_cast<size_t>(H) * HD);
-        kvt = dalloc<float>(HD); o = dalloc<float>(static_cast<size_t>(H) * HD);
+        x = dalloc<float>(D); q = dalloc<float>(static_cast<size_t>(H) * HD);
+        qr = dalloc<float>(c.q_lora + HD); kvt = qr + c.q_lora;   // [qr | kv]: attn_qkv_a's output
+        o = dalloc<float>(static_cast<size_t>(H) * HD);
         oa = dalloc<float>(static_cast<size_t>(c.o_groups) * c.o_lora); ao = dalloc<float>(D);
         lat = dalloc<float>(HD); ik = dalloc<float>(c.idx_dim);
         iq = dalloc<float>(static_cast<size_t>(c.idx_heads) * c.idx_dim); iw = dalloc<float>(c.idx_heads);
         isc = dalloc<float>(max_ctx);
         logit_e = dalloc<float>(c.n_expert); wsel = dalloc<float>(c.n_expert_used); ids = dalloc<int>(c.n_expert_used);
-        gbuf = dalloc<float>(c.n_ff_exp); ubuf = dalloc<float>(c.n_ff_exp); abuf = dalloc<float>(c.n_ff_exp);
+        gbuf = dalloc<float>(2 * c.n_ff_exp); ubuf = gbuf + c.n_ff_exp; abuf = dalloc<float>(c.n_ff_exp);   // [g | u]
         ebuf = dalloc<float>(D); moe = dalloc<float>(D); shx = dalloc<float>(D); ffo = dalloc<float>(D);
         win_idx = dalloc<int>(c.window); topk_idx = dalloc<int>(c.idx_top_k);
         {
@@ -686,14 +716,13 @@ struct Dsv41Engine::Impl {
         const int HD = c.head_dim, H = c.n_head, rd = c.rope_dims, ratio = c.compress_ratio[il];
         const float * freq = ratio ? freq_comp : freq_swa;
 
-        mv(p + "attn_q_a.weight", x, qr);
+        mv(p + "attn_qkv_a.fused", x, qr);   // qr and kvt
         norm(qr, qr, c.q_lora, p + "attn_q_a_norm.weight");
         P("qr", il, qr, c.q_lora);
         mv(p + "attn_q_b.weight", qr, q);
         cuda::dsv41::rope_tail(q, H, HD, rd, pos, freq, false, st);
         P("q", il, q, H * HD);
 
-        mv(p + "attn_kv.weight", x, kvt);
         norm(kvt, kvt, HD, p + "attn_kv_a_norm.weight");
         cuda::dsv41::rope_tail(kvt, 1, HD, rd, pos, freq, false, st);
         P("kv", il, kvt, HD);
@@ -867,8 +896,7 @@ struct Dsv41Engine::Impl {
     // the shared expert into shx (needs only x: hybrid decode queues it before the CPU experts, so it overlaps them)
     void shared_expert(int il) {
         const std::string p = "blk." + std::to_string(il) + ".";
-        mv(p + "ffn_gate_shexp.weight", x, gbuf);
-        mv(p + "ffn_up_shexp.weight", x, ubuf);
+        mv(p + "ffn_gate_up_shexp.fused", x, gbuf);   // gbuf and ubuf
         cuda::dsv41::swiglu_clamp(gbuf, ubuf, abuf, c.n_ff_exp, static_cast<float>(c.swiglu_limit), st);
         mv(p + "ffn_down_shexp.weight", abuf, shx);
     }
