@@ -574,6 +574,13 @@ __global__ void rmsnorm1_k(const float * x0, float * y0, int D0, const float * w
     }
 }
 
+struct CopySegs { uint32_t * dst[4]; const uint32_t * src[4]; int words[4]; int n; };
+__global__ void copy_segs_k(CopySegs c) {   // blockIdx.y: the segment
+    if (static_cast<int>(blockIdx.y) >= c.n) return;
+    const int k = blockIdx.y;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < c.words[k]; i += gridDim.x * blockDim.x) c.dst[k][i] = c.src[k][i];
+}
+
 __global__ void copy_k(uint32_t * __restrict__ dst, const uint32_t * __restrict__ src, size_t words) {
     for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < words; i += static_cast<size_t>(gridDim.x) * blockDim.x)
         dst[i] = src[i];
@@ -589,6 +596,21 @@ void rmsnorm2(const float * x0, float * y0, int D0, const float * w0, const floa
               float eps, cudaStream_t s) {
     if (D0 % 4 || D1 % 4) throw std::runtime_error("rmsnorm2: D not a multiple of 4");
     rmsnorm1_k<<<2, 1024, 0, s>>>(x0, y0, D0, w0, x1, y1, D1, w1, eps);
+}
+
+void copy_small_n(void * const * dst, const void * const * src, const size_t * bytes, int n, cudaStream_t s) {
+    if (n < 1 || n > 4) throw std::runtime_error("copy_small_n: 1 to 4 segments");
+    CopySegs c{};
+    int most = 0;
+    for (int k = 0; k < n; ++k) {
+        if (bytes[k] % 4) throw std::runtime_error("copy_small_n: not whole words");
+        c.dst[k] = static_cast<uint32_t *>(dst[k]);
+        c.src[k] = static_cast<const uint32_t *>(src[k]);
+        c.words[k] = static_cast<int>(bytes[k] / 4);
+        most = std::max(most, c.words[k]);
+    }
+    c.n = n;
+    copy_segs_k<<<dim3(std::max(1, std::min((most + 255) / 256, 16)), n), 256, 0, s>>>(c);
 }
 
 void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s) {

@@ -21,6 +21,7 @@ void rmsnorm2(const float * x0, float * y0, int D0, const float * w0, const floa
 // a few KB between device memory and pinned host memory (UVA: the kernel reads or writes the host pointer) by a
 // kernel, not a copy engine: a small copy then never queues behind a 9 MB expert copy on the same engine
 void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s);
+void copy_small_n(void * const * dst, const void * const * src, const size_t * bytes, int n, cudaStream_t s);   // 1-4 at once
 // fn . flat R (fn [M][hc*D] fp32) into mix, then hc_split from it: two launches, R read once (ss: 1 float of scratch)
 void hc_fn_split(const float * fn, int M, const float * R, const float * scale, const float * base, int hc, int D,
                  float norm_eps, float hc_eps, int iters, float * mix, float * ss, float * pre, float * post, float * comb,

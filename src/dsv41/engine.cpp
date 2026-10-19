@@ -831,9 +831,10 @@ struct Dsv41Engine::Impl {
         const auto tr0 = std::chrono::steady_clock::now();
         // into pinned buffers: a copy into pageable memory is a synchronous staged copy (~10 us each, 80 a token)
         // through kernels into pinned memory: the copy engines may be busy with expert copies for ~1 ms
-        cuda::dsv41::copy_small(route_h, ids, K * 4, st);
-        cuda::dsv41::copy_small(route_h + 64, wsel, K * 4, st);
-        if (hybrid) cuda::dsv41::copy_small(x_h, x, D * 4, st);   // the CPU experts' input
+        void * cdst[4] = {route_h, route_h + 64, x_h, route_h + 128};
+        const void * csrc[4] = {ids, wsel, x, pred_ids_d};
+        size_t cbytes[4] = {static_cast<size_t>(K) * 4, static_cast<size_t>(K) * 4, static_cast<size_t>(D) * 4, 0};
+        int ncopy = hybrid ? 3 : 2;   // x: the CPU experts' input; the prediction joins below
         // the next layer's router on this layer's FFN input: the experts it will likely pick (one sync with this one's)
         std::vector<int> next_pred;
         const int nk = std::min(std::max({pred_stats ? pred_k : 0, hybrid ? prefetch_k : 0, trace ? 24 : 0}), 64);
@@ -843,8 +844,10 @@ struct Dsv41Engine::Impl {
             mv(pn + "ffn_gate_inp.weight", x, pred_logit);
             cuda::dsv41::router_topk(pred_logit, V(pn + "exp_probs_b.bias"), c.n_expert, nk, 1.f, pred_ids_d, pred_w_d, st);
             next_pred.resize(nk);
-            cuda::dsv41::copy_small(route_h + 128, pred_ids_d, nk * 4, st);
+            if (!hybrid) { cdst[2] = cdst[3]; csrc[2] = csrc[3]; cbytes[2] = static_cast<size_t>(nk) * 4; ncopy = 3; }
+            else { cbytes[3] = static_cast<size_t>(nk) * 4; ncopy = 4; }
         }
+        cuda::dsv41::copy_small_n(cdst, csrc, cbytes, ncopy, st);
         ck(cudaStreamSynchronize(st), "router");
         std::vector<int> hid(reinterpret_cast<const int *>(route_h), reinterpret_cast<const int *>(route_h) + K);
         std::vector<float> hw(reinterpret_cast<const float *>(route_h + 64), reinterpret_cast<const float *>(route_h + 64) + K);
