@@ -74,15 +74,12 @@ __global__ void hc_split_k(const float * m, const float * R, const float * scale
     hc_split_warp(m, ss, scale, base, hc, n, norm_eps, hc_eps, iters, pre, post, comb);
 }
 
-// the single-token path: hc_fn_k has the mixes and the sum of squares already; one warp
-__global__ void hc_split_ss_k(const float * m, const float * ss, const float * scale, const float * base, int hc, int n,
-                              float norm_eps, float hc_eps, int iters, float * pre, float * post, float * comb) {
-    hc_split_warp(m, *ss, scale, base, hc, n, norm_eps, hc_eps, iters, pre, post, comb);
-}
-
 // m[r] = fn[r] . R (fn [M][K] fp32, K = hc * D), one block per row; block 0 also stores sum(R^2) (every block reads
-// all of R anyway). Replaces a warp-per-row matvec (24 rows: 6 blocks on the whole GPU) and hc_split's own R pass.
-__global__ void hc_fn_k(const float * __restrict__ W, int K, const float * __restrict__ R, float * m, float * ss_out) {
+// all of R anyway), and the last block to finish runs hc_split's Sinkhorn on them. Replaces a warp-per-row matvec
+// (24 rows: 6 blocks on the whole GPU), hc_split's own R pass and its launch.
+__global__ void hc_fn_k(const float * __restrict__ W, int K, const float * __restrict__ R, float * m, float * ss_out,
+                        unsigned * done, const float * scale, const float * base, int hc, float norm_eps, float hc_eps,
+                        int iters, float * pre, float * post, float * comb) {
     const float4 * w = reinterpret_cast<const float4 *>(W + static_cast<size_t>(blockIdx.x) * K);
     const float4 * r = reinterpret_cast<const float4 *>(R);
     float d = 0.f, ss = 0.f;
@@ -93,10 +90,19 @@ __global__ void hc_fn_k(const float * __restrict__ W, int K, const float * __res
     }
     d = block_sum(d);
     ss = block_sum(ss);
+    // the last block to finish runs the Sinkhorn (one launch fewer): its row results are visible after the fence
+    __shared__ bool last;
     if (threadIdx.x == 0) {
         m[blockIdx.x] = d;
         if (blockIdx.x == 0) *ss_out = ss;
+        __threadfence();
+        last = atomicAdd(done, 1u) == gridDim.x - 1;
     }
+    __syncthreads();
+    if (!last || threadIdx.x >= 32) return;
+    __threadfence();
+    hc_split_warp(m, *reinterpret_cast<volatile float *>(ss_out), scale, base, hc, K, norm_eps, hc_eps, iters, pre, post, comb);
+    if (threadIdx.x == 0) *done = 0;   // for the next launch (stream order)
 }
 
 // warp 0 of hc_split: from the raw mixes and sum(R^2) to pre, post, comb
@@ -624,8 +630,12 @@ void copy_small(void * dst, const void * src, size_t bytes, cudaStream_t s) {
 void hc_fn_split(const float * fn, int M, const float * R, const float * scale, const float * base, int hc, int D,
                  float norm_eps, float hc_eps, int iters, float * mix, float * ss, float * pre, float * post, float * comb,
                  cudaStream_t s) {
-    hc_fn_k<<<M, 512, 0, s>>>(fn, hc * D, R, mix, ss);
-    hc_split_ss_k<<<1, 32, 0, s>>>(mix, ss, scale, base, hc, hc * D, norm_eps, hc_eps, iters, pre, post, comb);
+    static unsigned * done = nullptr;   // the blocks finished; zero between launches
+    if (!done) {
+        if (cudaMalloc(&done, sizeof(unsigned)) != cudaSuccess || cudaMemset(done, 0, sizeof(unsigned)) != cudaSuccess)
+            throw std::runtime_error("hc_fn_split: counter");
+    }
+    hc_fn_k<<<M, 512, 0, s>>>(fn, hc * D, R, mix, ss, done, scale, base, hc, norm_eps, hc_eps, iters, pre, post, comb);
 }
 
 void hc_pre(const float * R, const float * pre, float * out, int hc, int D, cudaStream_t s) {
