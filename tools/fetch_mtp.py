@@ -32,7 +32,7 @@ def url(fname):
 
 def get(fname, start=None, end=None):
     """The bytes [start, end] (inclusive) of a file of the repository, or the whole file."""
-    req = urllib.request.Request(url(fname), headers={"User-Agent": "nano-cuda-moe-qwen38"})
+    req = urllib.request.Request(url(fname), headers={"User-Agent": "nano-cuda-moe"})
     if start is not None:
         req.add_header("Range", f"bytes={start}-{end}")
     resp = urllib.request.urlopen(req, timeout=60)
