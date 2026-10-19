@@ -111,7 +111,8 @@ struct Dsv41Engine::Impl {
     float * logit_e = nullptr, * wsel = nullptr, * gbuf = nullptr, * ubuf = nullptr, * abuf = nullptr, * ebuf = nullptr;
     float * moe = nullptr, * shx = nullptr, * ffo = nullptr;
     float * hc_ss = nullptr;   // hc_mix's sum of squares
-    uint32_t * route_h = nullptr;   // pinned: [0, 64) the picked ids, [64, 128) their weights, [128, 192) the prediction
+    uint32_t * route_h = nullptr;
+    float * logits_h = nullptr, * step_h = nullptr;   // pinned: the logits; a step's embedding row and first mix   // pinned: [0, 64) the picked ids, [64, 128) their weights, [128, 192) the prediction
     int * ids = nullptr, * win_idx = nullptr, * topk_idx = nullptr;
     float * emb = nullptr, * ekv = nullptr;
     uint8_t * erows = nullptr, * erows_h = nullptr;
@@ -182,6 +183,8 @@ struct Dsv41Engine::Impl {
     // BL_DSV41_EARLY=n (default 1): with two misses or more in a layer, up to n of them are copied into VRAM first and
     // computed on the GPU (the admission copy would happen anyway), the CPU takes the rest
     int early = std::getenv("BL_DSV41_EARLY") ? std::atoi(std::getenv("BL_DSV41_EARLY")) : 1;
+    // BL_DSV41_EARLY_ADAPT=1: up to BL_DSV41_EARLY, ~0.36 of the layer's misses
+    bool adaptive_early = std::getenv("BL_DSV41_EARLY_ADAPT") && std::atoi(std::getenv("BL_DSV41_EARLY_ADAPT")) != 0;
     uint64_t gpu_misses = 0;
     // VRAM slots kept free (their expert already copied back to RAM, off the critical path) so an early admission is
     // one host-to-device copy on its own stream, waiting for nothing else; BL_DSV41_FREE_SLOTS (default 4)
@@ -424,6 +427,8 @@ struct Dsv41Engine::Impl {
             cpu_out_d = dalloc<float>(static_cast<size_t>(c.n_expert_used) * D);
         }
         ck(cudaMallocHost(&route_h, 192 * 4), "pinned");
+        ck(cudaMallocHost(&logits_h, static_cast<size_t>(c.n_vocab) * 4), "pinned");
+        ck(cudaMallocHost(&step_h, static_cast<size_t>(D + c.hc) * 4), "pinned");
         pred_ids_d = dalloc<int>(64); pred_w_d = dalloc<float>(64); pred_logit = dalloc<float>(c.n_expert);
         if (dp4a) {
             ck(cudaMallocHost(&plan_h, sizeof(cuda::ExpertPlan)), "pinned");
@@ -644,6 +649,8 @@ struct Dsv41Engine::Impl {
         if (plan_h) cudaFreeHost(plan_h);
         if (plan2_h) cudaFreeHost(plan2_h);
         if (route_h) cudaFreeHost(route_h);
+        if (logits_h) cudaFreeHost(logits_h);
+        if (step_h) cudaFreeHost(step_h);
         if (pf.erows_h) cudaFreeHost(pf.erows_h);
         ram.reset();
         for (int fd : direct_fd) if (fd >= 0) ::close(fd);
@@ -956,7 +963,9 @@ struct Dsv41Engine::Impl {
             }
         }
         // the first ng misses: admitted now and computed on the GPU once their copy lands, while the CPU does the rest
-        const int ng = n >= 2 && exclusive ? std::min({early, n - 1, nready, static_cast<int>(free_vslots.size())}) : 0;
+        // how many: balance a GPU miss (~0.8 ms: the copy, then compute) against a CPU one (~0.45 ms): k ~ 0.36 n
+        const int want = adaptive_early ? std::max(1, static_cast<int>((n + 1) * 0.36f)) : early;
+        const int ng = n >= 2 && exclusive ? std::min({want, early, n - 1, nready, static_cast<int>(free_vslots.size())}) : 0;
         if (ng > 0) {
             const auto ta = std::chrono::steady_clock::now();
             std::memset(plan2_h, 0, sizeof *plan2_h);
@@ -1353,15 +1362,13 @@ struct Dsv41Engine::Impl {
                 std::memcpy(&v, row + 2 * i, 2);
                 e[i] = bf16_to_float(v);
             }
-            ck(cudaMemcpyAsync(x, e.data(), D * 4, cudaMemcpyHostToDevice, st), "embd");
+            // layer 0 has no previous sublayer: the identity mix picks copy 0 (pre, after the row in step_h)
+            ck(cudaStreamSynchronize(st), "step_h");   // the previous step's reads of step_h are done
+            std::memcpy(step_h, e.data(), D * 4);
+            for (int j = 0; j < hc; ++j) step_h[D + j] = j == 0 ? 1.f : 0.f;
+            cuda::dsv41::copy_small(x, step_h, D * 4, st);
+            cuda::dsv41::copy_small(pre, step_h + D, hc * 4, st);
             cuda::repeat(x, R, D, hc, st);
-            ck(cudaStreamSynchronize(st), "embd");
-        }
-        {   // layer 0 has no previous sublayer: the identity mix picks copy 0
-            std::vector<float> one(hc, 0.f);
-            one[0] = 1.f;
-            ck(cudaMemcpyAsync(pre, one.data(), hc * 4, cudaMemcpyHostToDevice, st), "pre");
-            ck(cudaStreamSynchronize(st), "pre");
         }
         const float eps = static_cast<float>(c.rms_eps), hc_eps = static_cast<float>(c.hc_eps);
 
@@ -1409,8 +1416,11 @@ struct Dsv41Engine::Impl {
         P("result_norm", -1, x, D);
         mv("output.weight", x, logits_d);
         P("result_output", -1, logits_d, c.n_vocab);
-        ck(cudaMemcpyAsync(logits.data(), logits_d, c.n_vocab * 4, cudaMemcpyDeviceToHost, st), "logits");
+        // by kernel into pinned memory (a pageable copy is staged and synchronous, and the D2H engine may be busy
+        // with an expert going back to RAM)
+        cuda::dsv41::copy_small(logits_h, logits_d, c.n_vocab * 4, st);
         ck(cudaStreamSynchronize(st), "step");
+        std::memcpy(logits.data(), logits_h, c.n_vocab * 4);
         t_total += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         ++n_steps;
         return logits;
