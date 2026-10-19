@@ -5,6 +5,8 @@
 //   bl-dsv41 --model SHARD1.gguf --tokens-file F --engram-rows     (the Engram row ids per position, no weights)
 //   bl-dsv41 ... --prefill          the prompt through the chunked prefill (then --gen steps)
 //   bl-dsv41 ... --check-prefill    prefill's logits at every position against one step per token: KL, top-1
+//   bl-dsv41 ... --force N          the first N tokens through prefill, the rest one step each (teacher-forced
+//                                   decode: the same work every run, for timing); --stats-after counts those steps
 //
 // Feeds the tokens one step each, prints the top-5 after each and then greedy-generates N more. --save-logits
 // writes every fed position's logits (T rows of n_vocab float32: tools/logits_compare.py against bl-ref-dump).
@@ -48,7 +50,7 @@ void usage() {
 
 int main(int argc, char ** argv) {
     std::string model, tokens_s, tokens_file, save_logits, dump_dir, filter = ".*";
-    int gen = 0, ctx = 4096, stats_after = -1;
+    int gen = 0, ctx = 4096, stats_after = -1, force = -1;
     bool engram_rows = false, use_prefill = false, check_prefill = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -66,6 +68,7 @@ int main(int argc, char ** argv) {
         else if (a == "--filter") filter = next();
         else if (a == "--engram-rows") engram_rows = true;
         else if (a == "--stats-after") stats_after = std::stoi(next());   // the report covers only the steps after N generated
+        else if (a == "--force") force = std::stoi(next());
         else if (a == "--prefill") use_prefill = true;          // the prompt through prefill(), then --gen steps
         else if (a == "--check-prefill") check_prefill = true;  // prefill's logits against stepping each token
         else { usage(); return 2; }
@@ -162,6 +165,19 @@ int main(int argc, char ** argv) {
             }
             std::printf("prefill vs steps over %zu positions: mean KL %.5f, max %.5f, top-1 agreement %d/%zu\n", prompt.size(),
                         kl_sum / prompt.size(), kl_max, agree, prompt.size());
+            std::printf("%s\n", eng.report().c_str());
+            return 0;
+        }
+        if (force >= 0) {   // teacher-forced: prefill the head, then step every remaining token whatever was predicted
+            const std::vector<int> head(prompt.begin(), prompt.begin() + std::min<size_t>(force, prompt.size()));
+            if (!head.empty()) eng.prefill(head);
+            int agree = 0, n = 0;
+            for (size_t i = head.size(); i < prompt.size(); ++i, ++n) {
+                if (n == stats_after) eng.reset_stats();
+                const auto & l = eng.step(prompt[i]);
+                if (i + 1 < prompt.size()) agree += top(l, 1)[0] == prompt[i + 1];
+            }
+            std::printf("forced %d steps, top-1 = next token %d/%d\n", n, agree, std::max(n - 1, 0));
             std::printf("%s\n", eng.report().c_str());
             return 0;
         }
