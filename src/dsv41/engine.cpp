@@ -162,12 +162,12 @@ struct Dsv41Engine::Impl {
     // its picks? (prefetch candidates)
     bool pred_stats = std::getenv("BL_DSV41_PRED") && std::atoi(std::getenv("BL_DSV41_PRED")) != 0;
     int pred_k = std::getenv("BL_DSV41_PRED_K") ? std::atoi(std::getenv("BL_DSV41_PRED_K")) : 6;
-    // BL_DSV41_PREFETCH=K (hybrid decode, default 0 = off): that prediction's top K are read into the RAM tier in the
+    // BL_DSV41_PREFETCH=K (hybrid decode, default 2; 0 = off): that prediction's top K are read into the RAM tier in the
     // background while this layer computes
-    int prefetch_k = std::getenv("BL_DSV41_PREFETCH") ? std::atoi(std::getenv("BL_DSV41_PREFETCH")) : 0;
-    // BL_DSV41_PREFETCH_DIST=d (default 1): the prediction is for layer il + d (a read takes ~6 ms, a layer ~3.5);
+    int prefetch_k = std::getenv("BL_DSV41_PREFETCH") ? std::atoi(std::getenv("BL_DSV41_PREFETCH")) : 2;
+    // BL_DSV41_PREFETCH_DIST=d (default 2): the prediction is for layer il + d (a read takes ~6 ms, a layer ~3.5);
     // the measurements (BL_DSV41_PRED, BL_DSV41_TRACE) assume 1
-    int prefetch_dist = std::getenv("BL_DSV41_PREFETCH_DIST") ? std::atoi(std::getenv("BL_DSV41_PREFETCH_DIST")) : 1;
+    int prefetch_dist = std::getenv("BL_DSV41_PREFETCH_DIST") ? std::atoi(std::getenv("BL_DSV41_PREFETCH_DIST")) : 2;
     // BL_DSV41_TRACE=FILE (measurement): per decode step and layer "pos layer: 6 picks | next layer's top 24" (cache
     // policy simulations: tools/dsv41_cache_sim.py)
     FILE * trace = std::getenv("BL_DSV41_TRACE") ? std::fopen(std::getenv("BL_DSV41_TRACE"), "w") : nullptr;
@@ -823,7 +823,7 @@ struct Dsv41Engine::Impl {
                 ev_a_set = true;
                 span0 = std::chrono::steady_clock::now();
             }
-            shared_and_out(il);
+            shared_and_out(il, true);
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -857,15 +857,18 @@ struct Dsv41Engine::Impl {
         shared_and_out(il);
     }
 
-    void shared_and_out(int il) {
+    // the shared expert into shx (needs only x: hybrid decode queues it before the CPU experts, so it overlaps them)
+    void shared_expert(int il) {
         const std::string p = "blk." + std::to_string(il) + ".";
-        const int D = c.n_embd, F = c.n_ff_exp;
-        const float lim = static_cast<float>(c.swiglu_limit);
-        P("ffn_moe_out", il, moe, D);
         mv(p + "ffn_gate_shexp.weight", x, gbuf);
         mv(p + "ffn_up_shexp.weight", x, ubuf);
-        cuda::dsv41::swiglu_clamp(gbuf, ubuf, abuf, F, lim, st);
+        cuda::dsv41::swiglu_clamp(gbuf, ubuf, abuf, c.n_ff_exp, static_cast<float>(c.swiglu_limit), st);
         mv(p + "ffn_down_shexp.weight", abuf, shx);
+    }
+    void shared_and_out(int il, bool shexp_done = false) {
+        const int D = c.n_embd;
+        P("ffn_moe_out", il, moe, D);
+        if (!shexp_done) shared_expert(il);
         P("ffn_shexp", il, shx, D);
         ck(cudaMemcpyAsync(ffo, moe, D * 4, cudaMemcpyDeviceToDevice, st), "ffn");
         cuda::add(ffo, shx, D, st);
@@ -906,6 +909,7 @@ struct Dsv41Engine::Impl {
             cuda::plan_down(expert_type, plan_d, 1 << cuda::kHit, 1, gu_expert_bytes, F, D, pact, pout, st);
             for (int i = 0; i < n; ++i) cuda::axpy(moe, pout + static_cast<size_t>(i) * cuda::kMaxT * D, hw[gk[i]], D, st);
         }
+        shared_expert(il);   // on the GPU while the CPU works
         const int n = static_cast<int>(ck_.size());
         std::vector<const uint8_t *> slot(n);
         std::vector<int> rslot(n);
