@@ -12,6 +12,9 @@
 
 namespace bl::cuda {
 
+// the cuBLAS handle created now (it is otherwise made on the first gemm, and needs some VRAM then: an engine that
+// sizes a cache by the free memory makes it first)
+void init_blas();
 // y [N][M] = x [N][K] . W^T for a weight matrix W (M rows of K values, any supported format) - dequantized in blocks
 // of rows into `scratch` (scratch_floats floats). ldy: the row stride of y (>= M; a column offset is y + offset).
 void gemm_w(uint32_t type, const void * W, size_t row_bytes, int M, int K, const float * x, int N, float * y, int ldy,

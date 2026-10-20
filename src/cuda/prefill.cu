@@ -529,6 +529,8 @@ unsigned blocks(size_t n) { return static_cast<unsigned>((n + 255) / 256); }
 
 }  // namespace
 
+void init_blas() { (void)handle(); }
+
 void gemm_w(uint32_t type, const void * W, size_t rb, int M, int K, const float * x, int N, float * y, int ldy, float * scratch,
             size_t scratch_floats, cudaStream_t s) {
     cublasHandle_t hd = handle();

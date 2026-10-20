@@ -562,6 +562,7 @@ struct Dsv41Engine::Impl {
             pout = dalloc<float>(static_cast<size_t>(cuda::kMaxSlots) * cuda::kMaxT * D);
         }
         alloc_pf(kChunk);   // prefill buffers (before the expert cache, which takes the rest)
+        cuda::init_blas();  // its workspace too: made lazily, the first prefill gemm could find no VRAM left
         // the expert cache takes the rest of VRAM
         const size_t per = 2 * gu_expert_bytes + d_expert_bytes;
         size_t fr = 0, to = 0;
