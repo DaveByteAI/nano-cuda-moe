@@ -371,6 +371,27 @@ __device__ uint32_t fkey(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
+// bscore[b] = max of score over block b (positions < n); the last block (it holds n - 1, the newest) +inf
+__global__ void block_max_k(const float * score, int n, int bs, float * bscore) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x, nb = (n + bs - 1) / bs;
+    if (b >= nb) return;
+    float m = -INFINITY;
+    for (int i = b * bs; i < min(n, (b + 1) * bs); ++i) m = fmaxf(m, score[i]);
+    bscore[b] = b == nb - 1 ? INFINITY : m;
+}
+
+__global__ void set_block_bits_k(const int * bidx, int k, uint32_t * mask) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < k) atomicOr(&mask[bidx[i] >> 5], 1u << (bidx[i] & 31));
+}
+
+__global__ void mask_scores_k(float * score, int n, int bs, const uint32_t * mask) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int b = i / bs;
+    if (!((mask[b >> 5] >> (b & 31)) & 1u)) score[i] = -INFINITY;
+}
+
 // one block of 1024 threads; thread i owns the contiguous chunk [i * per, (i+1) * per)
 __global__ void topk_sorted_k(const float * score, int n, int k, int * out) {
     __shared__ uint32_t sT;
@@ -692,6 +713,20 @@ void router_topk(const float * logits, const float * bias, int n, int k, float s
 void topk_sorted(const float * score, int n, int k, int * out, cudaStream_t s) {
     if (n <= 0 || k <= 0) return;
     topk_sorted_k<<<1, 1024, 0, s>>>(score, n, k < n ? k : n, out);
+}
+
+void candidate_mask(const float * score, int n, int bs, int k_blocks, float * bscore, int * bidx, uint32_t * mask, int mask_words,
+                    cudaStream_t s) {
+    const int nb = (n + bs - 1) / bs, k = k_blocks < nb ? k_blocks : nb;
+    if (n <= 0) return;
+    block_max_k<<<(nb + 255) / 256, 256, 0, s>>>(score, n, bs, bscore);
+    topk_sorted_k<<<1, 1024, 0, s>>>(bscore, nb, k, bidx);
+    cudaMemsetAsync(mask, 0, static_cast<size_t>(mask_words) * 4, s);
+    set_block_bits_k<<<(k + 255) / 256, 256, 0, s>>>(bidx, k, mask);
+}
+
+void mask_scores(float * score, int n, int bs, const uint32_t * mask, cudaStream_t s) {
+    if (n > 0) mask_scores_k<<<(n + 255) / 256, 256, 0, s>>>(score, n, bs, mask);
 }
 
 void swiglu_clamp(const float * g, const float * u, float * out, int n, float limit, cudaStream_t s) {

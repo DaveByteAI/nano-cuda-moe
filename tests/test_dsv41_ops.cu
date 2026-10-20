@@ -247,6 +247,49 @@ int main() {
             check(name, g, w, 0.f);
         }
     }
+    {   // the two-level indexer (model.py select_candidate_blocks, then the masked top-k) at n around and past 2048 x 8
+        const int bs = 8, kb = 2048;
+        for (int n : {16384, 16392, 40000, 131072}) {
+            const Vec sc = rnd(n);   // continuous: no ties, so the top-k sets are unique
+            const int nb = (n + bs - 1) / bs;
+            Vec bsc(nb, -INFINITY);
+            for (int i = 0; i < n; ++i) bsc[i / bs] = std::max(bsc[i / bs], sc[i]);
+            bsc[nb - 1] = INFINITY;   // the block holding the newest position is always in
+            std::vector<int> bid(nb);
+            std::iota(bid.begin(), bid.end(), 0);
+            const int k1 = std::min(kb, nb);
+            std::nth_element(bid.begin(), bid.begin() + k1 - 1, bid.end(), [&](int a, int b) { return bsc[a] > bsc[b]; });
+            std::vector<char> keep(nb, 0);
+            for (int i = 0; i < k1; ++i) keep[bid[i]] = 1;
+            Vec masked(sc);
+            for (int i = 0; i < n; ++i)
+                if (!keep[i / bs]) masked[i] = -INFINITY;
+            std::vector<int> id(n);
+            std::iota(id.begin(), id.end(), 0);
+            std::nth_element(id.begin(), id.begin() + 511, id.end(), [&](int a, int b) { return masked[a] > masked[b]; });
+            id.resize(512);
+            std::sort(id.begin(), id.end());
+
+            const int words = (nb + 31) / 32;
+            float * ds = dev(sc), * dbs = dev(Vec(nb));
+            int * dbi = dev(std::vector<int>(kb)), * dout = dev(std::vector<int>(512));
+            uint32_t * dm = dev(std::vector<uint32_t>(words));
+            candidate_mask(ds, n, bs, kb, dbs, dbi, dm, words, 0);
+            const auto m = host(dm, words);
+            Vec gm(nb), wm(nb);
+            for (int b = 0; b < nb; ++b) { gm[b] = static_cast<float>((m[b >> 5] >> (b & 31)) & 1u); wm[b] = keep[b]; }
+            char name[48];
+            std::snprintf(name, sizeof name, "candidate blocks n=%d", n);
+            check(name, gm, wm, 0.f);
+            mask_scores(ds, n, bs, dm, 0);
+            topk_sorted(ds, n, 512, dout, 0);
+            const auto got = host(dout, 512);
+            Vec g(512), w(512);
+            for (int i = 0; i < 512; ++i) { g[i] = static_cast<float>(got[i]); w[i] = static_cast<float>(id[i]); }
+            std::snprintf(name, sizeof name, "masked topk n=%d", n);
+            check(name, g, w, 0.f);
+        }
+    }
     {   // the batched (prefill) kernels against the one-token kernels, row by row (T = 5)
         const int T = 5, hc = 4, E = 5120, mixn = (2 + hc) * hc;
         Vec R = rnd(T * hc * E), m = rnd(T * mixn, 30.f), scale = {0.5f, 0.7f, 0.9f}, base = rnd(mixn);

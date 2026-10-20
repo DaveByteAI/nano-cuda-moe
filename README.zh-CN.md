@@ -196,7 +196,7 @@ RTX 3090 24 GB、Core i7-10700、64 GB DDR4、NVMe 固态硬盘；未注明的�
 
 ```bash
 scripts/download_dsv41.sh all        # 359 GB，下载到 models/DSV41-IQ2_XXS（可断点续传，校验 SHA-256）
-build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 32k
 build/bl-chat   --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf
 ```
 
@@ -208,7 +208,8 @@ build/bl-chat   --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Ex
 ### 限制
 
 - **专家是 2 bit。** 140 GB 的专家能跑起来靠的就是 IQ2_XXS，回答质量比官方原版低。
-- **上下文目前最多 16K**（超过 16K 个位置后的两级候选选择还没实现）。
+- **长上下文占显存。** 压缩 KV 用 fp32 存，每个 token 约 6.4 KB，从专家缓存里扣（32K 0.2 GB，128K 0.84 GB）；
+  20K token 的提示词能找回第一行的信息。20K 的提示词 prefill 约 4 分钟。
 - **没有投机解码。** 模型自带的草稿层（DSpark，3 层，这个 GGUF 里没有）可以用 `bl-dspark-pack` 从官方权重打包，
   猜得也准（5 个平均接受 3.25 个），但一次验证 6 个 token 每层要用约 21 个不同的专家（单个 token 是 6 个），在这里要花
   8.5 步的时间。只有模型整个放得进显存时才划算。

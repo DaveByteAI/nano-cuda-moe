@@ -135,6 +135,15 @@ Dsv41Config Dsv41Config::from_gguf(const GgufModel & g) {
         c.idx_key_source[il] = last_key;
         c.topk_source[il] = last_idx;
     }
+    // not in the GGUF: the release's config.json (candidate_source_layer_id 20, candidate_topk_blocks 2048,
+    // candidate_block_size 8), on the first ratio-1 layer, which is an indexer source in this checkpoint
+    for (int il = 0; il < c.n_layer && c.cand_source < 0; ++il)
+        if (c.compress_ratio[il] == 1 && c.is_topk_source(il)) c.cand_source = il;
+    if (c.cand_source >= 0) {
+        require(c.cand_source == 20, "the candidate source is layer 20 in the release (got " + std::to_string(c.cand_source) + ")");
+        c.cand_blocks = 2048;
+        c.cand_bs = 8;
+    }
 
     // the shapes the kernels assume (docs/DSV41.md); a different checkpoint fails here, not mid-forward
     auto shape = [&](const std::string & n, std::vector<int64_t> s) {

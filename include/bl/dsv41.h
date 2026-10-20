@@ -38,6 +38,10 @@ struct Dsv41Config {
     std::vector<int> kv_source;         // per layer: the layer whose compressed KV it reads (-1: none)
     std::vector<int> idx_key_source;    // per layer: the layer whose indexer keys it reads
     std::vector<int> topk_source;       // per layer: the layer whose top-k choice it uses
+    // the two-level indexer: cand_source's indexer keeps its cand_blocks best blocks of cand_bs compressed positions,
+    // and the top-k sources after it choose only inside them (-1: off)
+    int cand_source = -1, cand_blocks = 0, cand_bs = 0;
+    bool uses_candidates(int il) const { return cand_source >= 0 && il > cand_source && is_topk_source(il); }
 
     int engram_heads = 0, engram_dim = 0, engram_ngram = 0, engram_pad = 0;
     std::vector<int> engram_layers;                 // layer ids

@@ -209,7 +209,7 @@ can be on a slower disk: `ENGRAM_DIR`).
 
 ```bash
 scripts/download_dsv41.sh all        # 359 GB into models/DSV41-IQ2_XXS (resumable, SHA-256 checked)
-build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 16k
+build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 32k
 build/bl-chat   --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf
 ```
 
@@ -222,7 +222,8 @@ DeepInfer does (YOCO). `bl-dsv41 --tokens-file F --force 64
 ### Limits
 
 - **2-bit experts.** IQ2_XXS is what makes 140 GB of experts possible here; answers are below the official model's.
-- **Context up to 16K** for now (the two-level candidate selection past 16K positions is not implemented).
+- **Long context costs VRAM.** The compressed KV is kept in fp32, ~6.4 KB per token taken from the expert cache
+  (32K: 0.2 GB, 128K: 0.84 GB); a 20K-token prompt finds a fact from its first line. A 20K prompt takes ~4 minutes.
 - **No speculative decoding.** The model's own draft (DSpark, 3 layers, not in this GGUF) is packed from the official
   weights by `bl-dspark-pack` and guesses well (3.25 of 5 tokens accepted), but checking 6 tokens at once touches
   ~21 different experts per layer instead of 6 and costs 8.5 single steps here. It pays off only when the model fits in

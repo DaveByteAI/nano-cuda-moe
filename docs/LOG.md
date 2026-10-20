@@ -813,3 +813,18 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 - 端到端（bl-server，OpenAI 格式）：问北京明天天气 → `get_weather({"city":"北京","days":1})`；回传结果后正常作答，
   会话复用 350 token（重新渲染的 DSML 和模型生成的一致）。思考 + 流式：问上海和广州后天 → 两个并行调用（days=2），
   content 为空、没有 DSML 漏出；回传后复用 496 token。295 token 的工具提示词 prefill 22 s。
+
+## 2026-10-20 dsv41：两级候选选择，上下文不再限 16K
+
+- 照官方 `model.py` 的 `select_candidate_blocks`：第 20 层（候选源）的 indexer 分数按 8 个位置一块取最大，最新的那块固定入选
+  （它没填满，会被老块挤掉），留 top-2048 块做成位掩码；第 24、28、32、36 层（之后的 top-k 源）在 top-512 之前把块外的位置
+  设成 -inf。块数不到 2048 时全选，掩码不用（16K 以内和原来一样）。三个参数 GGUF 里没有，写在 `Dsv41Config`（取自 config.json）。
+- 新 kernel：`candidate_mask`（块最大值 → 复用 `topk_sorted` 选块 → 位掩码）、`mask_scores`。`test_dsv41_ops`：块集合和掩码后的
+  top-512 与 CPU 版 `select_candidate_blocks` 完全一致（n = 16384 / 16392 / 40000 / 131072）。
+- prefill 的打分缓冲区 `pf.isc` 原来是 T × max_ctx（4096 行 × 128K = 2 GB），改成按行分片、最多 256 MB；16K 时一片就是整块。
+- 回归（16K 以内）：`--check-prefill` 512 个位置，改前 KL 0.048、top-1 479/512，改后 0.049、485/512（`BL_DSV41_CACHE_GB=14`，
+  改前的版本不调小缓存时 OOM）。这项指标本身波动大（混合解码的累加顺序）。
+- 大海捞针：第一行写"保险柜密码是 7391-2846"，接整份 LOG.md，最后问密码，共 20629 token、`--ctx 32768`：答"仓库管理员的保险柜
+  密码是 7391-2846"。prefill 230 s（90 tok/s，第 20 层起 14 s）。
+- 显存：压缩 KV + indexer key 每 token 约 6.4 KB（fp32），32K 0.2 GB、128K 0.84 GB，从专家缓存里扣。bl-chat / bl-server
+  不再把上下文压到 16K（默认 32K）。

@@ -10,7 +10,7 @@ boundless 的 DeepSeek-V4.1 引擎（`src/dsv41/`）的实现依据。来源：
 
 ```bash
 build/bl-chat   --model ../models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf --ctx 8192
-build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16k --port 8080     # OpenAI 接口 + 网页（上下文目前最多 16384）
+build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 32k --port 8080     # OpenAI 接口 + 网页
 ```
 
 - 两个程序按 GGUF 的架构名自动选引擎（`bl::open_chat`）。分词用 libllama（架构名不认识时用只有元数据的临时副本加载词表，
@@ -44,11 +44,11 @@ build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16
 | 压缩比 | 第 0、1 层 0；第 2–19 层 2；第 20–39 层 1（列表长 43，后 3 个属于 DSpark 层） |
 | KV 源层 | 2、8、14、20：只有它们带压缩器；后面的层共用最近一个源层的压缩 KV |
 | indexer 源层 | 2、8、14、20、24、28、32、36：32 头 × 128，每个 query 选 top-512 个压缩位置；后面的层共用最近一个源层的选择结果 |
-| 两级候选 | 第 20 层以后先按 8 个一块选 2048 块；压缩位置不到 16384 个时等于全选，**先不实现，上下文限 16K** |
+| 两级候选 | 第 20 层的 indexer 把分数按 8 个位置一块取最大，留 2048 块（最新的一块必留）；第 24–36 层只在这些块里选 top-512。压缩位置不到 16384 个时等于全选。GGUF 里没有这三个参数，取自官方 config.json |
 | YOCO | 第 20 层（第一个 ratio=1 的层）是分界：第 20–39 层的压缩 KV 和 indexer K 都只来自第 20 层的输入，prefill 时这些层只跑最后 128 个 token（DeepInfer 的 `n_prefill_layer`） |
 | Engram | 第 1 层和第 14 层；4-gram，每个 n 长度 8 个头，每 token 查 (4−1)×8 = 24 行 × 256 维 |
 | RMSNorm eps | **1e-20**（hc 和 Engram 的 rsqrt 同样用这个 eps） |
-| 上下文 | 1,048,576（这个分支先做到 16K） |
+| 上下文 | 1,048,576（实测到 20.6K；KV 用 fp32，每 token 约 6.4 KB 显存） |
 
 ## 前向（单 token；prefill 时按 token 批量做同样的计算）
 

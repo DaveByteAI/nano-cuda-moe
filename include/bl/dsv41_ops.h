@@ -2,6 +2,8 @@
 // kernel.py / engram.py code it reproduces. The quantized matvecs are bl::cuda::matvec, the norms rmsnorm_rows.
 #pragma once
 
+#include <cstdint>
+
 #include <cuda_runtime.h>
 
 namespace bl::cuda::dsv41 {
@@ -50,6 +52,15 @@ void indexer_score(const float * q, const float * w, float wscale, const float *
 // the k = min(k, n) largest of score[0..n) as indices in increasing order (ties: the lower index first), one block
 // (radix select on the float bits, then an ordered scan): the indexer's top-k without a trip to the host
 void topk_sorted(const float * score, int n, int k, int * out, cudaStream_t s);
+
+// The two-level indexer (model.py select_candidate_blocks): for score[0..n) of one query, the k_blocks best blocks of bs
+// positions (a block scored by its best position; the block holding position n - 1 always in) as a bit mask, bit b of
+// mask[b / 32] for block b. Scratch: bscore [ceil(n / bs)] floats, bidx [k_blocks] ints. Only needed when there are more
+// than k_blocks blocks (else every block is in and the mask is not used).
+void candidate_mask(const float * score, int n, int bs, int k_blocks, float * bscore, int * bidx, uint32_t * mask, int mask_words,
+                    cudaStream_t s);
+// level two: score[i] = -inf for every position i < n whose block i / bs is not in mask
+void mask_scores(float * score, int n, int bs, const uint32_t * mask, cudaStream_t s);
 
 // Gate (sqrtsoftplus, noaux_tc): s = sqrt(softplus(logit)); the top k by s + bias; w = s / sum(s) * scale
 void router_topk(const float * logits, const float * bias, int n, int k, float scale, int * ids, float * w, cudaStream_t s);

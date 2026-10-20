@@ -109,6 +109,14 @@ struct Dsv41Engine::Impl {
     float * mix = nullptr, * pre = nullptr, * a_pre = nullptr, * post = nullptr, * comb = nullptr;
     float * x = nullptr, * qr = nullptr, * q = nullptr, * kvt = nullptr, * o = nullptr, * oa = nullptr, * ao = nullptr;
     float * lat = nullptr, * ik = nullptr, * iq = nullptr, * iw = nullptr, * isc = nullptr;
+    // the two-level indexer (past cand_blocks * cand_bs compressed positions): the candidate source's block mask, the
+    // decode step's (cmask) and the prefill rows' (pf.cmask, cand_words per row); scratch for building one
+    uint32_t * cmask = nullptr;
+    float * cand_bscore = nullptr;
+    int * cand_bidx = nullptr;
+    int cand_words = 0;
+    bool cand_on = false;                 // this decode step's mask is in use (more blocks than cand_blocks)
+    std::vector<char> pf_cand;            // the same per prefill row
     float * logit_e = nullptr, * wsel = nullptr, * gbuf = nullptr, * ubuf = nullptr, * abuf = nullptr, * ebuf = nullptr;
     float * moe = nullptr, * shx = nullptr, * ffo = nullptr;
     float * hc_ss = nullptr;   // hc_mix's sum of squares
@@ -249,6 +257,8 @@ struct Dsv41Engine::Impl {
         float * win, * ckv, * csc, * lat, * ik, * iq, * iw, * isc, * logit_e, * w, * moe, * g, * u, * a, * sh, * ffo;
         float * emb, * ekv, * act, * gscratch, * logits;
         int * ids, * a0, * na, * nb, * nvis, * topk, * tok, * win_ids;
+        uint32_t * cmask;
+        int isc_rows;   // pf.isc holds the scores of this many rows at a time (row stride max_ctx)
         float * wa;
         void * xq, * xg, * actq;
         cuda::MoeItem * items;
@@ -416,7 +426,6 @@ struct Dsv41Engine::Impl {
     }
 
     Impl(const std::string & shard1, int ctx) : g(shard1), c(Dsv41Config::from_gguf(g)), max_ctx(ctx) {
-        if (max_ctx > 16384) throw std::runtime_error("phase A: --ctx at most 16384 (the two-level candidate mask is not implemented)");
         ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
         const int D = c.n_embd, HD = c.head_dim, H = c.n_head;
 
@@ -509,6 +518,13 @@ struct Dsv41Engine::Impl {
         lat = dalloc<float>(HD); ik = dalloc<float>(c.idx_dim);
         iq = dalloc<float>(static_cast<size_t>(c.idx_heads) * c.idx_dim); iw = dalloc<float>(c.idx_heads);
         isc = dalloc<float>(max_ctx);
+        if (c.cand_source >= 0) {
+            const int nb = max_ctx / c.cand_bs + 1;
+            cand_words = (nb + 31) / 32;
+            cmask = dalloc<uint32_t>(cand_words);
+            cand_bscore = dalloc<float>(nb);
+            cand_bidx = dalloc<int>(c.cand_blocks);
+        }
         logit_e = dalloc<float>(c.n_expert); wsel = dalloc<float>(c.n_expert_used); ids = dalloc<int>(c.n_expert_used);
         gbuf = dalloc<float>(2 * c.n_ff_exp); ubuf = gbuf + c.n_ff_exp; abuf = dalloc<float>(c.n_ff_exp);   // [g | u]
         ebuf = dalloc<float>(D); moe = dalloc<float>(D); shx = dalloc<float>(D); ffo = dalloc<float>(D);
@@ -627,7 +643,10 @@ struct Dsv41Engine::Impl {
         pf.ckv = pfalloc<float>((T + 1) * HD); pf.csc = pfalloc<float>((T + 1) * HD);
         pf.lat = pfalloc<float>(T * HD); pf.ik = pfalloc<float>(T * c.idx_dim);
         pf.iq = pfalloc<float>(T * c.idx_heads * c.idx_dim); pf.iw = pfalloc<float>(T * c.idx_heads);
-        pf.isc = pfalloc<float>(T * static_cast<size_t>(max_ctx));
+        // at most 256 MB of scores: every row of a chunk at 16K, a slice of them at a longer context
+        pf.isc_rows = static_cast<int>(std::min<size_t>(T, std::max<size_t>(1, (size_t{1} << 26) / max_ctx)));
+        pf.isc = pfalloc<float>(pf.isc_rows * static_cast<size_t>(max_ctx));
+        pf.cmask = pfalloc<uint32_t>(T * static_cast<size_t>(std::max(cand_words, 1)));
         pf.logit_e = pfalloc<float>(T * c.n_expert); pf.w = pfalloc<float>(A); pf.ids = pfalloc<int>(A);
         pf.moe = pfalloc<float>(T * D); pf.g = pfalloc<float>(T * c.n_ff_exp); pf.u = pfalloc<float>(T * c.n_ff_exp);
         pf.a = pfalloc<float>(T * c.n_ff_exp); pf.sh = pfalloc<float>(T * D); pf.ffo = pfalloc<float>(T * D);
@@ -1014,6 +1033,12 @@ struct Dsv41Engine::Impl {
         const float wscale = 1.f / std::sqrt(static_cast<float>(c.idx_dim) * c.idx_heads);
         cuda::dsv41::indexer_score(iq, iw, wscale, idx_keys[c.idx_key_source[il]], n_vis, c.idx_heads, c.idx_dim, isc, st);
         P("idx_score", il, isc, n_vis);
+        if (il == c.cand_source) {   // level one: the best blocks, when there are more than can all be kept
+            cand_on = (n_vis + c.cand_bs - 1) / c.cand_bs > c.cand_blocks;
+            if (cand_on) cuda::dsv41::candidate_mask(isc, n_vis, c.cand_bs, c.cand_blocks, cand_bscore, cand_bidx, cmask, cand_words, st);
+        } else if (c.uses_candidates(il) && cand_on) {   // level two: only inside them
+            cuda::dsv41::mask_scores(isc, n_vis, c.cand_bs, cmask, st);
+        }
         // on the GPU, in position order like the reference's re-sort; how many is known here, so no sync
         const int k = std::min(c.idx_top_k, n_vis);
         cuda::dsv41::topk_sorted(isc, n_vis, k, topk_idx, st);
@@ -1536,16 +1561,33 @@ struct Dsv41Engine::Impl {
         for (int t = 0; t < T; ++t) { nvis[t] = (pos0 + t + 1) / ratio; nmax = std::max(nmax, nvis[t]); }
         for (int t = 0; t < T; ++t) pf_nb[t] = std::min(c.idx_top_k, nvis[t]);
         up(pf.nb, pf_nb);
+        if (il == c.cand_source) pf_cand.assign(T, 0);
         if (nmax == 0) return;
         up(pf.nvis, nvis);
         gemm(p + "indexer.attn_q_b.weight", pf.qr, T, pf.iq);
         cuda::dsv41::rope_tail_rows(pf.iq, T, c.idx_heads, c.idx_dim, c.rope_dims, pos0, 1, freq_comp, false, st);
         gemm(p + "indexer.proj.weight", pf.x, T, pf.iw);
         const float wscale = 1.f / std::sqrt(static_cast<float>(c.idx_dim) * c.idx_heads);
-        cuda::dsv41::indexer_score_rows(pf.iq, pf.iw, wscale, idx_keys[c.idx_key_source[il]], pf.nvis, nmax, c.idx_heads, c.idx_dim, T,
-                                        pf.isc, max_ctx, st);
-        for (int t = 0; t < T; ++t)
-            if (nvis[t] > 0) cuda::dsv41::topk_sorted(pf.isc + static_cast<size_t>(t) * max_ctx, nvis[t], pf_nb[t], pf.topk + t * c.idx_top_k, st);
+        const size_t qrow = static_cast<size_t>(c.idx_heads) * c.idx_dim;
+        for (int t0 = 0; t0 < T; t0 += pf.isc_rows) {   // the scores a slice of rows at a time
+            const int n = std::min(pf.isc_rows, T - t0);
+            int nm = 0;
+            for (int t = t0; t < t0 + n; ++t) nm = std::max(nm, nvis[t]);
+            cuda::dsv41::indexer_score_rows(pf.iq + t0 * qrow, pf.iw + t0 * c.idx_heads, wscale, idx_keys[c.idx_key_source[il]],
+                                            pf.nvis + t0, nm, c.idx_heads, c.idx_dim, n, pf.isc, max_ctx, st);
+            for (int t = t0; t < t0 + n; ++t) {
+                if (nvis[t] == 0) continue;
+                float * sc = pf.isc + static_cast<size_t>(t - t0) * max_ctx;
+                uint32_t * mk = pf.cmask + static_cast<size_t>(t) * cand_words;
+                if (il == c.cand_source && (nvis[t] + c.cand_bs - 1) / c.cand_bs > c.cand_blocks) {
+                    pf_cand[t] = 1;
+                    cuda::dsv41::candidate_mask(sc, nvis[t], c.cand_bs, c.cand_blocks, cand_bscore, cand_bidx, mk, cand_words, st);
+                } else if (c.uses_candidates(il) && pf_cand[t]) {
+                    cuda::dsv41::mask_scores(sc, nvis[t], c.cand_bs, mk, st);
+                }
+                cuda::dsv41::topk_sorted(sc, nvis[t], pf_nb[t], pf.topk + t * c.idx_top_k, st);
+            }
+        }
     }
 
     void moe_chunk(int il, int T) {
