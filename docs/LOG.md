@@ -764,3 +764,27 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
   专家轨迹：连续 6 个 token 每层用到 21.4 个不同专家（单个 6 个），而 CPU 算未命中按（token，专家）计、读盘按不同专家计。
   就算写一条理想的小批量混合验证路径，上限也只有约 1.1–1.2 倍，再减去草稿自己 7.2 GB 专家占掉的 VRAM / RAM 缓存。
 - 结论：卸载场景下投机解码赚不到；模型整个放得进显存（多卡、96 GB 的卡）时才值得做。打包工具和参考实现留着。
+
+## 2026-10-20 dsv41：YOCO prefill 截断（照 DeepInfer 的 decoder SWA bounded replay）
+
+- DeepSeek 开源了推理框架 DeepInfer（只支持 SM100 和昇腾 950）。它的配置转换（`hugging_face/config.py`）把第一个
+  ratio=1 的层（第 20 层）当作 YOCO 的分界线 `n_prefill_layer`：第 20–39 层的压缩 KV 和 indexer K 只来自第 20 层的输入，
+  各层自己的窗口 KV 才用本层的 hidden（`yoco_swa_share_hidden: False`）。所以 prefill 时后 20 层只要跑提示词最后 128 个 token
+  （官方 Q&A："总 prefill 计算量近乎减半"）。
+- 实现（`prefill_chunk`）：到第 20 层先对整块算 hc 混合、norm、压缩器和 indexer K，再把 hc 流 `R` 和待用的 `pre` 缩到回放段的行，
+  后面的层照常跑；回放段之前的位置没有后 20 层的窗口 KV，这些层的窗口从 `dec_from` 起（即官方的 `max(s, i-127)`）。
+  只在不要求每个位置 logits 时生效（`--check-prefill`、`--save-logits` 不受影响）；`BL_DSV41_YOCO_KEEP`（默认 128，0 关）。
+- 质量（`--force 1024`，再逐 token 喂 128 个真实 token，对比每步 logits）：截断 vs 不截断平均 KL 0.011，top-1 相同 124/128；
+  两次都不截断之间就有 KL 0.009（混合解码的 CPU/GPU 累加顺序不固定），截断的误差和这个噪声差不多。猜中真实下一个 token：
+  73/127 vs 75、72/127。
+- 速度（交替各跑两次，同一 4096 token 提示词）：
+
+| | prefill | 其中第 20 层起 | 读盘 |
+|---|---|---|---|
+| 不截断 | 81.6 s（50 tok/s） | 38.6 s | 13008 |
+| 截断 | **55.1 s（74 tok/s）** | **12.1 s** | 9080 |
+
+  1024 token：57 → 41.6 s。后 20 层就算只跑 128 个 token，每层也要用到大多数专家，所以没有到一半。
+- 顺带发现：Engram 表的页缓存被挤掉时，4096 token 的 prefill 光读 Engram 行就要 43 s（热的时候 0.2 s），单次测量的方差主要来自这里。
+- `bl-dsv41 --prefill` 的 bug：判断要不要存 logits 用的是没打开的 `ofstream` 的布尔值（总是 true），每次都申请全位置 logits
+  （4096 token 是 2.1 GB，直接 OOM），截断也不会生效。改成 `is_open()`；`--force` 也能 `--save-logits` 了（逐步的 logits）。

@@ -18,10 +18,10 @@ build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16
   没有工具调用（模板里没有）。
 - 默认混合解码（`BL_DSV41_HYBRID=1`）；启动时按 `bench/dsv41/expert_profile.txt` 把最常用的专家装进 VRAM 和 RAM 层，约 35 s
   （`BL_DSV41_PROFILE=none` 跳过）。
-- 速度（3090 + 64 GB）：新内容 9–12 tok/s，重复性的输出约 20 tok/s；1K 提示词 prefill 约 17 tok/s。
+- 速度（3090 + 64 GB）：新内容 9–12 tok/s，重复性的输出约 20 tok/s；prefill 1K 提示词约 25 tok/s、4K 约 74 tok/s（YOCO 截断：后 20 层只跑最后 128 个 token，见 [LOG.md](LOG.md) 2026-10-20）。
 - 调参的环境变量（默认值都是测过的最好值）：`BL_DSV41_RAM_GB`（RAM 层大小，上限 MemAvailable − 8 GB）、`BL_DSV41_CACHE_GB`、
   `BL_DSV41_IO_THREADS`、`BL_DSV41_PREFETCH` / `_DIST`、`BL_DSV41_GHOST`、`BL_DSV41_EARLY`、`BL_DSV41_HEAD_Q8`、
-  `BL_DSV41_PREFILL_MAX`。测速：`bl-dsv41 --force 64 --stats-after 128`（见 [LOG.md](LOG.md) 2026-10-19）。
+  `BL_DSV41_PREFILL_MAX`、`BL_DSV41_YOCO_KEEP`（YOCO 截断的回放长度，0 关）。测速：`bl-dsv41 --force 64 --stats-after 128`（见 [LOG.md](LOG.md) 2026-10-19）。
 
 ## 超参数
 
@@ -42,6 +42,7 @@ build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16
 | KV 源层 | 2、8、14、20：只有它们带压缩器；后面的层共用最近一个源层的压缩 KV |
 | indexer 源层 | 2、8、14、20、24、28、32、36：32 头 × 128，每个 query 选 top-512 个压缩位置；后面的层共用最近一个源层的选择结果 |
 | 两级候选 | 第 20 层以后先按 8 个一块选 2048 块；压缩位置不到 16384 个时等于全选，**先不实现，上下文限 16K** |
+| YOCO | 第 20 层（第一个 ratio=1 的层）是分界：第 20–39 层的压缩 KV 和 indexer K 都只来自第 20 层的输入，prefill 时这些层只跑最后 128 个 token（DeepInfer 的 `n_prefill_layer`） |
 | Engram | 第 1 层和第 14 层；4-gram，每个 n 长度 8 个头，每 token 查 (4−1)×8 = 24 行 × 256 维 |
 | RMSNorm eps | **1e-20**（hc 和 Engram 的 rsqrt 同样用这个 eps） |
 | 上下文 | 1,048,576（这个分支先做到 16K） |

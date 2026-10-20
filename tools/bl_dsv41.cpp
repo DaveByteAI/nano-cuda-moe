@@ -190,6 +190,7 @@ int main(int argc, char ** argv) {
             for (size_t i = head.size(); i < prompt.size(); ++i, ++n) {
                 if (n == stats_after) eng.reset_stats();
                 const auto & l = eng.step(prompt[i]);
+                if (lg.is_open()) lg.write(reinterpret_cast<const char *>(l.data()), V * 4);   // the stepped positions' logits
                 if (i + 1 < prompt.size()) agree += top(l, 1)[0] == prompt[i + 1];
             }
             std::printf("forced %d steps, top-1 = next token %d/%d\n", n, agree, std::max(n - 1, 0));
@@ -198,8 +199,8 @@ int main(int argc, char ** argv) {
         }
         if (use_prefill) {
             std::vector<float> all;
-            const auto & l = eng.prefill(prompt, lg ? &all : nullptr);
-            if (lg) lg.write(reinterpret_cast<const char *>(all.data()), all.size() * 4);
+            const auto & l = eng.prefill(prompt, lg.is_open() ? &all : nullptr);
+            if (lg.is_open()) lg.write(reinterpret_cast<const char *>(all.data()), all.size() * 4);
             const auto t = top(l, 5);
             std::printf("prefill %zu tokens -> top5", prompt.size());
             for (int id : t) std::printf(" %d(%.2f)", id, l[id]);
@@ -208,7 +209,7 @@ int main(int argc, char ** argv) {
         }
         for (size_t i = 0; i < (use_prefill ? 0 : prompt.size()); ++i) {
             const auto & l = eng.step(prompt[i]);
-            if (lg) lg.write(reinterpret_cast<const char *>(l.data()), V * 4);
+            if (lg.is_open()) lg.write(reinterpret_cast<const char *>(l.data()), V * 4);
             const auto t = top(l, 5);
             std::printf("pos %4zu tok %6d -> top5", i, prompt[i]);
             for (int id : t) std::printf(" %d(%.2f)", id, l[id]);

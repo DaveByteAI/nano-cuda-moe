@@ -257,6 +257,14 @@ struct Dsv41Engine::Impl {
         size_t gscratch_floats;
     } pf{};
     std::vector<int> pf_nb;                                 // the current top-k counts per chunk token (host)
+    // YOCO prefill truncation (DeepInfer's decoder SWA bounded replay): the layers from the first ratio-1 layer on
+    // (n_enc) read compressed KV and indexer keys made from that layer's input alone, so a prompt runs them only for
+    // its last BL_DSV41_YOCO_KEEP tokens (default 128, at least the window; 0 = off). Approximate: those layers'
+    // window KV before the replay start is never made, the replayed queries see the window from there on (dec_from)
+    int yoco_keep = std::getenv("BL_DSV41_YOCO_KEEP") ? std::atoi(std::getenv("BL_DSV41_YOCO_KEEP")) : 128;
+    int n_enc = -1;                                         // the first ratio-1 layer (-1: no truncation)
+    int dec_from = 0;                                       // layers >= n_enc have window KV from this position on
+    int pf_replay = -1;                                     // this prefill's replay start (-1: every row everywhere)
 
     std::vector<int> toks;                                  // every token fed so far
     std::vector<float> logits;
@@ -902,6 +910,7 @@ struct Dsv41Engine::Impl {
     void reset() {
         toks.clear();
         n_topk = 0;
+        dec_from = 0;
         for (int il = 0; il < c.n_layer; ++il) {   // only the windows matter (they are read before they are filled)
             ck(cudaMemsetAsync(win[il], 0, sizeof(float) * c.window * c.head_dim, st), "reset");
         }
@@ -1326,20 +1335,60 @@ struct Dsv41Engine::Impl {
                     }
             }
         }
-        // per-position counts the attention needs (host-known): window range in pf.win, visible compressed entries
-        const int W0 = std::min(pos0, c.window - 1);   // earlier raw KV the first query sees
-        std::vector<int> a0(T), na(T);
-        for (int t = 0; t < T; ++t) {
-            const int p = pos0 + t, first = std::max(0, p - c.window + 1);
-            a0[t] = first - (pos0 - W0);
-            na[t] = p - first + 1;
-        }
-        up(pf.a0, a0);
-        up(pf.na, na);
-        const int na_max = *std::max_element(na.begin(), na.end());
+        // per-position counts the attention needs (host-known): window range in pf.win (raw KV from position `from` on),
+        // visible compressed entries
+        int W0 = 0, na_max = 0;   // earlier raw KV the first query sees; the longest window
+        auto window_rows = [&](int from) {
+            W0 = std::min(pos0 - from, c.window - 1);
+            std::vector<int> a0(T), na(T);
+            for (int t = 0; t < T; ++t) {
+                const int p = pos0 + t, first = std::max(from, p - c.window + 1);
+                a0[t] = first - (pos0 - W0);
+                na[t] = p - first + 1;
+            }
+            up(pf.a0, a0);
+            up(pf.na, na);
+            na_max = *std::max_element(na.begin(), na.end());
+        };
+        window_rows(0);
         pf_nb.assign(T, 0);
 
+        auto td = std::chrono::steady_clock::now();   // when layer n_enc starts (the time from there on: t_pf_dec)
+        auto dec_done = [&] { if (n_enc >= 0) t_pf_dec += std::chrono::duration<double>(std::chrono::steady_clock::now() - td).count(); };
         for (int il = 0; il < c.n_layer; ++il) {
+            if (il == n_enc) {
+                ck(cudaStreamSynchronize(st), "prefill chunk");
+                td = std::chrono::steady_clock::now();
+            }
+            const bool cut = il == n_enc && pf_replay >= 0;
+            if (cut) {   // this layer's compressed KV and indexer keys for every row, then only the replayed rows on
+                const std::string p = "blk." + std::to_string(il) + ".";
+                gemm(p + "hc_attn_fn.weight", pf.R, T, pf.mix);
+                cuda::dsv41::hc_split_rows(pf.mix, pf.R, V(p + "hc_attn_scale.weight"), V(p + "hc_attn_base.weight"), hc, D, T, eps,
+                                           hc_eps, c.hc_sinkhorn, pf.a_pre, pf.post, pf.comb, st);
+                cuda::dsv41::hc_pre_rows(pf.R, pf.pre, pf.x, hc, D, T, st);
+                norm_rows(pf.x, T, D, p + "attn_norm.weight");
+                compress_chunk(il, pos0, T);
+                const int r0 = std::max(0, pf_replay - pos0);
+                if (r0 >= T) {   // all before the replay: nothing more to do (no logits from this chunk)
+                    ck(cudaStreamSynchronize(st), "prefill chunk");
+                    dec_done();
+                    return;
+                }
+                if (r0 > 0) {   // the stream and the pending pre mix of rows r0.. to the front (via the spare buffers)
+                    const size_t hd = c.hc_dim();
+                    ck(cudaMemcpyAsync(pf.R2, pf.R + r0 * hd, (T - r0) * hd * 4, cudaMemcpyDeviceToDevice, st), "replay");
+                    std::swap(pf.R, pf.R2);
+                    ck(cudaMemcpyAsync(pf.post, pf.pre + static_cast<size_t>(r0) * hc, static_cast<size_t>(T - r0) * hc * 4,
+                                       cudaMemcpyDeviceToDevice, st), "replay");
+                    ck(cudaMemcpyAsync(pf.pre, pf.post, static_cast<size_t>(T - r0) * hc * 4, cudaMemcpyDeviceToDevice, st), "replay");
+                    pos0 += r0;
+                    T -= r0;
+                    pf_nb.assign(T, 0);
+                }
+                window_rows(dec_from);
+            }
+
             const std::string p = "blk." + std::to_string(il) + ".";
             const int eg = c.engram_index(il);
             if (eg >= 0 && engram_on) {
@@ -1363,7 +1412,7 @@ struct Dsv41Engine::Impl {
                                        c.hc_sinkhorn, pf.a_pre, pf.post, pf.comb, st);
             cuda::dsv41::hc_pre_rows(pf.R, pf.pre, pf.x, hc, D, T, st);
             norm_rows(pf.x, T, D, p + "attn_norm.weight");
-            attention_chunk(il, pos0, T, W0, na_max);
+            attention_chunk(il, pos0, T, W0, na_max, cut);
             cuda::dsv41::hc_post_rows(pf.ao, pf.R, pf.post, pf.comb, pf.R2, hc, D, T, st);
             std::swap(pf.R, pf.R2);
 
@@ -1382,11 +1431,12 @@ struct Dsv41Engine::Impl {
         if (all_logits) gemm("output.weight", pf.x, T, pf.logits + static_cast<size_t>(pos0 - pf_logits_from) * c.n_vocab);
         else mv("output.weight", pf.x + static_cast<size_t>(T - 1) * D, logits_d);
         ck(cudaStreamSynchronize(st), "prefill chunk");
+        dec_done();
         (void)rd; (void)HD; (void)H;
     }
     int pf_logits_from = 0;
 
-    void attention_chunk(int il, int pos0, int T, int W0, int na_max) {
+    void attention_chunk(int il, int pos0, int T, int W0, int na_max, bool compressed = false) {   // compressed: its KV made already
         const std::string p = "blk." + std::to_string(il) + ".";
         const int HD = c.head_dim, H = c.n_head, rd = c.rope_dims, ratio = c.compress_ratio[il], D = c.n_embd;
         const float * freq = ratio ? freq_comp : freq_swa;
@@ -1413,7 +1463,7 @@ struct Dsv41Engine::Impl {
         int nb_max = 0;
         const float * comp = pf.win;   // unused when no compressed keys
         if (ratio > 0) {
-            if (c.is_kv_source(il)) compress_chunk(il, pos0, T);
+            if (c.is_kv_source(il) && !compressed) compress_chunk(il, pos0, T);
             comp = comp_kv[c.kv_source[il]];
             if (c.is_topk_source(il)) topk_chunk(il, pos0, T);
             for (int v : pf_nb) nb_max = std::max(nb_max, v);
@@ -1575,6 +1625,13 @@ struct Dsv41Engine::Impl {
             toks.push_back(t);
         }
         const int n = static_cast<int>(prompt.size());
+        // YOCO: the layers from n_enc on only for the last keep tokens (all rows when every position's logits are asked)
+        if (n_enc < 0)
+            for (int il = 0; il < c.n_layer && n_enc < 0; ++il)
+                if (c.compress_ratio[il] == 1) n_enc = il;
+        const int keep = yoco_keep > 0 ? std::max(yoco_keep, c.window) : 0;
+        pf_replay = n_enc > 0 && keep > 0 && !all_out && n > keep ? pos_start + n - keep : -1;
+        if (pf_replay >= 0) dec_from = pf_replay;
         // a long prompt: one chunk of up to pf_max, its buffers in VRAM borrowed from the expert cache
         int chunk = kChunk;
         if (n > kChunk && pf_max > kChunk) {
@@ -1616,7 +1673,7 @@ struct Dsv41Engine::Impl {
         n_prefill += n;
         return logits;
     }
-    double t_prefill = 0;
+    double t_prefill = 0, t_pf_dec = 0;   // t_pf_dec: of it, the layers from n_enc on (and the head)
     long n_prefill = 0;
 
     const std::vector<float> & step(int token) {
@@ -1725,7 +1782,7 @@ void Dsv41Engine::set_probe(Probe p) { p_->probe = std::move(p); }
 int Dsv41Engine::warm(const std::string & profile) { return p_->warm(profile); }
 void Dsv41Engine::reset_stats() {
     auto & q = *p_;
-    q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_router = q.t_admit = q.t_prefill = 0;
+    q.t_total = q.t_expert_copy = q.t_engram = q.t_cpu = q.t_gpu_wait = q.t_ram = q.t_router = q.t_admit = q.t_prefill = q.t_pf_dec = 0;
     for (double & t : q.t_host) t = 0;
     q.t_gpu_pre = q.t_span = 0;
     for (int i = 0; i < 3; ++i) { q.t_gpu_wait_by[i] = 0; q.n_gpu_wait_by[i] = 0; }
@@ -1740,7 +1797,7 @@ std::string Dsv41Engine::report() const {
     std::ostringstream os;
     const auto & q = *p_;
     if (q.n_steps == 0 && q.n_prefill == 0) return "no steps";
-    if (q.n_prefill) os << "prefill " << q.n_prefill << " tokens in " << q.t_prefill << " s (" << q.n_prefill / q.t_prefill << " tok/s); ";
+    if (q.n_prefill) os << "prefill " << q.n_prefill << " tokens in " << q.t_prefill << " s (" << q.n_prefill / q.t_prefill << " tok/s, layers " << q.n_enc << "+ " << q.t_pf_dec << " s); ";
     const int ns = std::max(q.n_steps, 1);
     os << q.n_steps << " steps, " << 1000.0 * q.t_total / ns << " ms/token (expert copies, prefill included: "
        << 1000.0 * q.t_expert_copy / ns << " ms, Engram rows " << 1000.0 * q.t_engram / ns << " ms); "
