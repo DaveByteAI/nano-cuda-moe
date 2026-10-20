@@ -24,6 +24,7 @@ public:
     struct ToolCall {
         std::string name;
         std::vector<std::pair<std::string, std::string>> args;   // name, value as written (a string as is, else JSON)
+        std::string arguments = {};   // the arguments object as the client sent it (JSON; deepseek41 writes them from it)
     };
     struct Message {
         std::string role;        // system | developer | user | assistant | tool

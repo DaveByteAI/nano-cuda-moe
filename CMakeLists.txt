@@ -77,6 +77,7 @@ if(BL_ENABLE_CUDA)
   # the programs
   add_library(bl_chat STATIC src/chat.cpp src/chat_models.cpp)
   target_link_libraries(bl_chat PUBLIC bl_cuda bl_text bl_dsv41)
+  target_include_directories(bl_chat PRIVATE ${BL_VENDOR})   # nlohmann/json (the deepseek41 tool prompt)
   add_executable(bl-chat tools/bl_chat.cpp)
   target_link_libraries(bl-chat PRIVATE bl_chat)
   add_library(bl_httplib STATIC ${BL_VENDOR}/cpp-httplib/httplib.cpp)

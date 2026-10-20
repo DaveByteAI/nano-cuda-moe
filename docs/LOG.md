@@ -798,3 +798,18 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 - `render_dsv41` 改为接收 effort（`ChatParams::think`），移到 `bl` 命名空间以便测试；`tests/test_dsv41_template.cpp`：
   6 组对话 × 5 种 effort 共 30 个用例，期望值由 deepseek-recipe 0.2.0 生成，全部逐字节一致。
 - 端到端：`bl-chat --think xhigh` 问"17 乘以 23"，思考后答 391，思考和正文分开正常。
+
+## 2026-10-20 dsv41：工具调用（DSML，照 deepseek-recipe）；修 chat/server 长提示词的 cublasCreate 失败
+
+- 修 bug：bl-chat / bl-server 里第一个超过 64 token 的提示词报 `cublasCreate failed`（之后每个请求都报 `cublasSgemm failed`）。
+  cuBLAS 句柄是第一次 gemm 时才建的，那时专家缓存已经拿走剩下的显存、长 prefill 又借走了缓存段，句柄没显存可用。
+  引擎加载时、算缓存大小之前先建好（`cuda::init_blas`）。bl-dsv41 碰巧没撞上（留的 0.5 GB 余量没被预热占满）。
+- 工具调用：`render_dsv41` 改成按官方逐条消息的结构写（`<｜Assistant｜>` 属于助手消息），加上工具提示词（Python 风格的
+  JSON，保持客户端的 key 顺序）、DSML 调用块、`<tool_result>`、带工具时保留历史思考内容。`Text::ToolCall` 加 `arguments`
+  （客户端原样的 JSON，DSML 要靠它区分 `string="true"` 和 `"false"`）。`ChatModel::tool_call_tag()` 告诉 server 用哪种
+  解析和在哪里截住流式输出；server 加 DSML 解析。
+- 测试：`test_dsv41_template` 扩到 43 个用例（含工具定义、并行调用、嵌套参数和 `1e-05`、工具结果、思考），期望值由
+  deepseek-recipe 0.2.0 生成，全部逐字节一致。
+- 端到端（bl-server，OpenAI 格式）：问北京明天天气 → `get_weather({"city":"北京","days":1})`；回传结果后正常作答，
+  会话复用 350 token（重新渲染的 DSML 和模型生成的一致）。思考 + 流式：问上海和广州后天 → 两个并行调用（days=2），
+  content 为空、没有 DSML 漏出；回传后复用 496 token。295 token 的工具提示词 prefill 22 s。

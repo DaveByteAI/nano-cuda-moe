@@ -58,11 +58,14 @@ public:
     virtual std::string report() const = 0;
     virtual std::string family() const = 0;           // a model name prefix: "qwen3.8-flash", "deepseek-v4.1-flash"
     virtual bool        tools() const { return true; } // function calling through the template
+    virtual std::string tool_call_tag() const { return "<tool_call>"; }   // where the answer's calls start
     virtual void        save_cache(const std::string &) {}
 };
 // cache_file: the qwen3.8 engine's --expert-cache (ignored by the others)
 std::unique_ptr<ChatModel> open_chat(const std::string & shard1, int max_ctx, const std::string & cache_file = "");
-// the deepseek41 prompt of a conversation (think_effort: ChatParams::think), with the generation prompt
-std::string render_dsv41(const std::vector<Text::Message> & msgs, const std::string & think_effort);
+// the deepseek41 prompt of a conversation (think_effort and tools: ChatParams::think and ::tools), with the generation
+// prompt
+std::string render_dsv41(const std::vector<Text::Message> & msgs, const std::string & think_effort,
+                         const std::vector<std::string> & tools = {});
 
 }  // namespace bl

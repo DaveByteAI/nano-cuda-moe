@@ -196,7 +196,7 @@ RTX 3090 24 GB, Core i7-10700, 64 GB DDR4, an NVMe SSD; greedy unless noted.
 | New text fed token by token (Chinese / English / CUDA code, 512 tokens each) | 9.9 / 9.6 / 11.7 tok/s |
 | Repetitive output | ~20 tok/s |
 | llama.cpp (the DeepSeek-V4.1 PR), same machine and file, experts on the CPU | 0.97 tok/s |
-| A 1,000-token prompt | 59 s (~17 tok/s) |
+| A 1,000- / 4,000-token prompt | 42 / 55 s (~25 / 74 tok/s) |
 | Startup, warming the VRAM and RAM tiers from a usage profile | ~40 s |
 
 Each token reads about 13 experts from the disk; more RAM means fewer reads (simulated: ~14 tok/s with 96 GB, ~17
@@ -213,14 +213,16 @@ build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Ex
 build/bl-chat   --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf
 ```
 
-Thinking (`--think`, `enable_thinking`) uses the release's `<think>` prompt. `bl-dsv41 --tokens-file F --force 64
+Thinking (`--think`, `enable_thinking`, `reasoning_effort`) and tool calls (OpenAI `tools`, in the model's DSML format)
+use the prompts of DeepSeek's own encoder, [deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe), byte for
+byte (`tests/test_dsv41_template.cpp`). Layers 20-39 of a long prompt run only for its last 128 tokens, as DeepSeek's
+DeepInfer does (YOCO). `bl-dsv41 --tokens-file F --force 64
 --stats-after 128` is the speed benchmark (`bench/dsv41/`); the tuning variables are in [docs/DSV41.md](docs/DSV41.md).
 
 ### Limits
 
 - **2-bit experts.** IQ2_XXS is what makes 140 GB of experts possible here; answers are below the official model's.
 - **Context up to 16K** for now (the two-level candidate selection past 16K positions is not implemented).
-- **No tool calls** (the GGUF's chat template has none).
 - **No speculative decoding.** The model's own draft (DSpark, 3 layers, not in this GGUF) is packed from the official
   weights by `bl-dspark-pack` and guesses well (3.25 of 5 tokens accepted), but checking 6 tokens at once touches
   ~21 different experts per layer instead of 6 and costs 8.5 single steps here. It pays off only when the model fits in

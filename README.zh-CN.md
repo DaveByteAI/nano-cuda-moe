@@ -184,7 +184,7 @@ RTX 3090 24 GB、Core i7-10700、64 GB DDR4、NVMe 固态硬盘；未注明的�
 | 新内容逐 token 喂入（中文 / 英文 / CUDA 代码，各 512 个 token） | 9.9 / 9.6 / 11.7 tok/s |
 | 重复性的输出 | 约 20 tok/s |
 | llama.cpp（DeepSeek-V4.1 的 PR），同一台机器、同一个文件，专家放 CPU | 0.97 tok/s |
-| 1,000 个 token 的提示词 | 59 s（约 17 tok/s） |
+| 1,000 / 4,000 个 token 的提示词 | 42 / 55 s（约 25 / 74 tok/s） |
 | 启动，按使用频率把常用专家预热进显存和内存 | 约 40 s |
 
 每个 token 平均从盘读约 13 个专家；内存越大读得越少（模拟：96 GB 约 14 tok/s，128 GB 约 17）。从 4.9 到 10 tok/s 的每一步，
@@ -200,14 +200,15 @@ build/bl-server --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Ex
 build/bl-chat   --model models/DSV41-IQ2_XXS/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Experts-Q8-Dense-Engram-00001-of-00010.gguf
 ```
 
-思考模式（`--think`、`enable_thinking`）用官方发布的 `<think>` 提示。测速：`bl-dsv41 --tokens-file F --force 64
+思考模式（`--think`、`enable_thinking`、`reasoning_effort`）和工具调用（OpenAI 的 `tools`，模型自己的 DSML 格式）的提示词
+和 DeepSeek 官方编码组件 [deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe) 逐字节一致
+（`tests/test_dsv41_template.cpp`）。长提示词的第 20–39 层只跑最后 128 个 token，和官方推理框架 DeepInfer 的做法一样（YOCO）。测速：`bl-dsv41 --tokens-file F --force 64
 --stats-after 128`（输入在 `bench/dsv41/`）；调参的环境变量见 [docs/DSV41.md](docs/DSV41.md)。
 
 ### 限制
 
 - **专家是 2 bit。** 140 GB 的专家能跑起来靠的就是 IQ2_XXS，回答质量比官方原版低。
 - **上下文目前最多 16K**（超过 16K 个位置后的两级候选选择还没实现）。
-- **没有工具调用**（GGUF 里的对话模板没有）。
 - **没有投机解码。** 模型自带的草稿层（DSpark，3 层，这个 GGUF 里没有）可以用 `bl-dspark-pack` 从官方权重打包，
   猜得也准（5 个平均接受 3.25 个），但一次验证 6 个 token 每层要用约 21 个不同的专家（单个 token 是 6 个），在这里要花
   8.5 步的时间。只有模型整个放得进显存时才划算。

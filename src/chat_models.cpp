@@ -12,6 +12,7 @@
 #include "bl/chat.h"
 #include "bl/dsv41.h"
 #include "gguf.h"
+#include "nlohmann/json.hpp"
 
 #include <unistd.h>
 
@@ -75,15 +76,14 @@ public:
     int         position() const override { return eng_.position() + (pending_ >= 0 ? 1 : 0); }
     std::string report() const override { return eng_.report(); }
     std::string family() const override { return "deepseek-v4.1-flash"; }
-    bool        tools() const override { return false; }
+    std::string tool_call_tag() const override { return "<｜DSML｜ calls>"; }
 
     ChatResult reply(const std::vector<Text::Message> & messages, const ChatParams & p,
                      const std::function<bool(const std::string &, bool)> & on_text) override {
         using clock = std::chrono::steady_clock;
-        if (!p.tools.empty()) throw std::runtime_error("this model's template has no tool calls");
         ChatResult res;
         const bool think = !p.think.empty();
-        const std::string rendered = render_dsv41(messages, p.think);
+        const std::string rendered = render_dsv41(messages, p.think, p.tools);
         // the session's text a prefix of the new conversation: feed the rest (after the pending token); else start over
         std::string suffix;
         if (!session_.empty() && rendered.size() > session_.size() && rendered.compare(0, session_.size(), session_) == 0) {
@@ -182,31 +182,121 @@ private:
 
 }  // namespace
 
-// tokenizer.chat_template of the deepseek41 GGUF ("checked against the exact release's encoding.py"): BOS, system as
-// <｜System｜>, a user turn as <｜User｜> (consecutive ones joined by a blank line), an assistant turn as its text and
-// <｜end▁of▁sentence｜>; after a user turn (or a later system one) that the assistant answers: <｜Assistant｜></think>.
-// Thinking (not in that template, the release's thinking mode, as deepseek-recipe's DeepseekV41Encoding renders it):
-// the first message is preceded by <｜System｜>Reasoning Effort: N ...\n\n (low 50, max 100, else 75; a leading system
-// message's text follows it without a second <｜System｜>), and the generation prompt ends <｜Assistant｜><think>.
-std::string render_dsv41(const std::vector<Text::Message> & msgs, const std::string & think_effort) {
+namespace {
+
+// JSON the way Python's json.dumps writes it (", " and ": ", the keys in their order), as the official encoding does
+std::string py_dump(const nlohmann::ordered_json & v) {
+    if (v.is_object()) {
+        std::string s = "{";
+        for (auto it = v.begin(); it != v.end(); ++it) s += (it == v.begin() ? "" : ", ") + nlohmann::ordered_json(it.key()).dump() + ": " + py_dump(it.value());
+        return s + "}";
+    }
+    if (v.is_array()) {
+        std::string s = "[";
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + py_dump(v[i]);
+        return s + "]";
+    }
+    return v.dump();
+}
+
+const char * kDsv41ToolPrompt = R"(## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+)";
+
+// an assistant turn's calls as a DSML block (a string argument as is, any other value as JSON)
+std::string dsv41_calls(const std::vector<Text::ToolCall> & calls) {
+    std::string s = "\n\n<｜DSML｜ calls>\n";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        const Text::ToolCall & c = calls[i];
+        s += (i ? "\n" : "") + std::string("<｜DSML｜ invoke name=\"") + c.name + "\">\n";
+        nlohmann::ordered_json args = nlohmann::ordered_json::object();
+        if (!c.arguments.empty()) {
+            try { args = nlohmann::ordered_json::parse(c.arguments); } catch (...) { args = {{"arguments", c.arguments}}; }
+            if (!args.is_object()) args = {{"arguments", c.arguments}};
+        } else {
+            for (const auto & [k, v] : c.args) args[k] = v;   // no client JSON: every value as written, a string
+        }
+        size_t j = 0;
+        for (auto it = args.begin(); it != args.end(); ++it, ++j) {
+            const bool str = it.value().is_string();
+            s += (j ? "\n" : "") + std::string("<｜DSML｜ parameter name=\"") + it.key() + "\" string=\"" + (str ? "true" : "false") + "\">" +
+                 (str ? it.value().get<std::string>() : py_dump(it.value())) + "</｜DSML｜ parameter>";
+        }
+        s += "\n</｜DSML｜ invoke>";
+    }
+    return s + "\n</｜DSML｜ calls>";
+}
+
+}  // namespace
+
+// deepseek-recipe's DeepseekV41Encoding (the official API's prompts; tests/test_dsv41_template.cpp holds its renderings):
+// BOS; a first message preceded by <｜System｜> when it is a system message or when thinking, and when thinking by
+// "Reasoning Effort: N ...\n\n" (low 50, max 100, else 75); system <｜System｜>text, user <｜User｜>text and tool
+// <｜User｜><tool_result>text</tool_result> (after a user or tool turn: "\n\n" instead of <｜User｜>); an assistant turn
+// <｜Assistant｜>, then </think> - or, thinking with tools, <think>its reasoning</think> - its text, its calls as a DSML
+// block, <｜end▁of▁sentence｜>. With tools, the first system message (an empty one put first if there is none) gets
+// "\n\n" and the tool prompt with one schema per line. The generation prompt: <｜Assistant｜><think> or </think>.
+std::string render_dsv41(const std::vector<Text::Message> & in, const std::string & think_effort, const std::vector<std::string> & tools) {
     const bool think = !think_effort.empty();
+    std::vector<Text::Message> msgs = in;
+    for (auto & m : msgs)
+        if (m.role == "developer") m.role = "system";
+    if (!tools.empty()) {
+        if (msgs.empty() || msgs[0].role != "system") msgs.insert(msgs.begin(), Text::Message{"system", "", ""});
+        std::string t = kDsv41ToolPrompt;
+        for (size_t i = 0; i < tools.size(); ++i) {   // an OpenAI tool ({"type", "function": {...}}) or the function itself
+            const auto j = nlohmann::ordered_json::parse(tools[i]);
+            const auto & fn = j.contains("function") ? j["function"] : j;
+            nlohmann::ordered_json d = {{"name", fn.at("name")}, {"description", fn.value("description", "")},
+                                        {"parameters", fn.contains("parameters") ? fn["parameters"] : nlohmann::ordered_json()}};
+            t += (i ? "\n" : "") + py_dump(d);
+        }
+        msgs[0].content += "\n\n" + t + "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+    }
     std::string s = "<｜begin▁of▁sentence｜>";
-    if (think)
-        s += "<｜System｜>Reasoning Effort: " + std::string(think_effort == "low" ? "50" : think_effort == "max" ? "100" : "75") +
-             " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
     for (size_t i = 0; i < msgs.size(); ++i) {
         const Text::Message & m = msgs[i];
-        const std::string role = m.role == "developer" ? "system" : m.role;
-        if (!m.tool_calls.empty()) throw std::runtime_error("this model's template has no tool calls");
-        if (role == "system") s += (i == 0 && think ? "" : "<｜System｜>") + m.content;
-        else if (role == "user") s += (i > 0 && msgs[i - 1].role == "user" ? "\n\n" : "<｜User｜>") + m.content;
-        else if (role == "assistant") s += m.content + "<｜end▁of▁sentence｜>";
-        else throw std::runtime_error("this model's template takes system, user and assistant messages (got " + m.role + ")");
-        const bool last = i + 1 == msgs.size();
-        if ((last || msgs[i + 1].role == "assistant") && (role == "user" || (role == "system" && i > 0)))
-            s += last && think ? "<｜Assistant｜><think>" : "<｜Assistant｜></think>";
+        const std::string & role = m.role;
+        if (i == 0 && (think || role == "system")) s += "<｜System｜>";
+        if (i == 0 && think)
+            s += "Reasoning Effort: " + std::string(think_effort == "low" ? "50" : think_effort == "max" ? "100" : "75") +
+                 " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+        const bool after_user = i > 0 && (msgs[i - 1].role == "user" || msgs[i - 1].role == "tool");
+        if (role == "system") s += (i > 0 ? "<｜System｜>" : "") + m.content;
+        else if (role == "user") s += (after_user ? "\n\n" : "<｜User｜>") + m.content;
+        else if (role == "tool") s += (after_user ? "\n\n" : "<｜User｜>") + ("<tool_result>" + m.content + "</tool_result>");
+        else if (role == "assistant") {
+            // earlier reasoning only with tools (the official encoding drops it otherwise)
+            const bool reasoning = think && i > 0 && !tools.empty();
+            s += reasoning ? "<｜Assistant｜><think>" + m.reasoning + "</think>" : "<｜Assistant｜></think>";
+            s += m.content;
+            if (!m.tool_calls.empty()) s += dsv41_calls(m.tool_calls);
+            s += "<｜end▁of▁sentence｜>";
+        } else {
+            throw std::runtime_error("this model's template takes system, user, assistant and tool messages (got " + m.role + ")");
+        }
     }
-    return s;
+    return s + (think ? "<｜Assistant｜><think>" : "<｜Assistant｜></think>");
 }
 
 std::unique_ptr<ChatModel> open_chat(const std::string & shard1, int max_ctx, const std::string & cache_file) {

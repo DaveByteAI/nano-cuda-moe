@@ -3,7 +3,7 @@
 //   POST /v1/chat/completions   messages, stream, temperature, top_p, top_k, max_tokens / max_completion_tokens, seed,
 //                               reasoning_effort, chat_template_kwargs.enable_thinking; non-standard: spec (MTP drafts)
 //   GET  /health
-// Function calling: "tools" go into the model's template; the model's <tool_call> blocks come back as "tool_calls"
+// Function calling: "tools" go into the model's template; the model's calls (qwen3.8 <tool_call>, deepseek41 DSML) come back as "tool_calls"
 // (finish_reason "tool_calls"; streamed, the text before them streams and the calls come in one delta at the end), and
 // assistant turns with "tool_calls" and "tool" messages are written back the template's way.
 // Thinking is off unless the request asks (enable_thinking: true or a reasoning_effort); the thinking comes back as
@@ -156,6 +156,43 @@ Answer split_tool_calls(const std::string & text, const json & tools, const std:
     return a;
 }
 
+// deepseek41's calls: <｜DSML｜ calls> <｜DSML｜ invoke name="F"> <｜DSML｜ parameter name="K" string="true|false">V
+// </｜DSML｜ parameter> ... (string="false": V is JSON)
+Answer split_dsml_calls(const std::string & text, const std::string & id_prefix) {
+    static const std::string kCalls = "<｜DSML｜ calls>", kInvoke = "<｜DSML｜ invoke name=\"", kInvokeEnd = "</｜DSML｜ invoke>",
+                             kParam = "<｜DSML｜ parameter name=\"", kParamEnd = "</｜DSML｜ parameter>";
+    Answer a;
+    const size_t at = text.find(kCalls);
+    a.content = trim_ws(text.substr(0, at));
+    if (at == std::string::npos) return a;
+    for (size_t i = text.find(kInvoke, at); i != std::string::npos; i = text.find(kInvoke, i + 1)) {
+        const size_t ne = text.find('"', i + kInvoke.size());
+        if (ne == std::string::npos) break;
+        const std::string name = text.substr(i + kInvoke.size(), ne - i - kInvoke.size());
+        const size_t end = std::min(text.find(kInvokeEnd, ne), text.find(kInvoke, ne));
+        json args = json::object();
+        for (size_t p = text.find(kParam, ne); p != std::string::npos && p < end; p = text.find(kParam, p + 1)) {
+            const size_t ke = text.find('"', p + kParam.size()), ge = text.find('>', ke);
+            if (ke == std::string::npos || ge == std::string::npos) break;
+            const std::string key = text.substr(p + kParam.size(), ke - p - kParam.size());
+            const bool as_string = text.compare(ke, 15, "\" string=\"true\"") == 0;
+            const size_t ve = text.find(kParamEnd, ge);
+            const std::string val = text.substr(ge + 1, ve == std::string::npos ? std::string::npos : ve - ge - 1);
+            json v = val;
+            if (!as_string) try { v = json::parse(val); } catch (...) { v = val; }
+            args[key] = v;
+        }
+        a.calls.push_back({{"id", id_prefix + std::to_string(a.calls.size())}, {"type", "function"},
+                           {"function", {{"name", name}, {"arguments", args.dump()}}}});
+    }
+    return a;
+}
+
+// the answer's calls in the format of the model's template (tag: ChatModel::tool_call_tag)
+Answer split_calls(const std::string & tag, const std::string & text, const json & tools, const std::string & id_prefix) {
+    return tag == "<tool_call>" ? split_tool_calls(text, tools, id_prefix) : split_dsml_calls(text, id_prefix);
+}
+
 json error_json(const std::string & msg, const std::string & type = "invalid_request_error") {
     return json{{"error", {{"message", msg}, {"type", type}}}};
 }
@@ -293,6 +330,7 @@ int main(int argc, char ** argv) {
                         if (args.is_string()) args = trim_ws(args.get<std::string>()).empty() ? json::object() : json::parse(args.get<std::string>());
                         for (auto it = args.begin(); it != args.end(); ++it)
                             call.args.push_back({it.key(), it.value().is_string() ? it.value().get<std::string>() : py_json(it.value())});
+                        call.arguments = args.dump();
                         msg.tool_calls.push_back(std::move(call));
                     }
                 msgs.push_back(std::move(msg));
@@ -328,7 +366,8 @@ int main(int argc, char ** argv) {
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
                 const bl::ChatResult r = cur.chat->reply(msgs, cp);
-                const Answer a = tools.empty() ? Answer{r.content} : split_tool_calls(r.content, tools, "call_" + std::to_string(seq) + "_");
+                const Answer a = tools.empty() ? Answer{r.content}
+                                               : split_calls(cur.chat->tool_call_tag(), r.content, tools, "call_" + std::to_string(seq) + "_");
                 json msg{{"role", "assistant"}, {"content", a.content.empty() && !a.calls.empty() ? json(nullptr) : json(a.content)}};
                 if (!r.reasoning.empty()) msg["reasoning_content"] = r.reasoning;
                 if (!a.calls.empty()) msg["tool_calls"] = a.calls;
@@ -358,8 +397,8 @@ int main(int argc, char ** argv) {
             send(chunk({{"role", "assistant"}, {"content", ""}}, nullptr));
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
-                // with tools, the text streams up to a <tool_call> (a tail that could be its start waits); the calls follow at the end
-                static const std::string kTag = "<tool_call>";
+                // with tools, the text streams up to the calls' tag (a tail that could be its start waits); the calls follow at the end
+                const std::string kTag = cur.chat->tool_call_tag();
                 std::string held;
                 bool in_call = false;
                 auto text_out = [&](const std::string & s) { return s.empty() || send(chunk(json{{"content", s}}, nullptr)); };
@@ -379,7 +418,7 @@ int main(int argc, char ** argv) {
                     return text_out(out);
                 });
                 if (!in_call) text_out(held);
-                const Answer a = tools.empty() ? Answer{} : split_tool_calls(r.content, tools, "call_" + id.substr(9) + "_");
+                const Answer a = tools.empty() ? Answer{} : split_calls(kTag, r.content, tools, "call_" + id.substr(9) + "_");
                 if (!a.calls.empty()) {
                     json tc = a.calls;
                     for (size_t i = 0; i < tc.size(); ++i) tc[i]["index"] = static_cast<int>(i);

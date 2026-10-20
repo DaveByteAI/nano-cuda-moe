@@ -16,7 +16,9 @@ build/bl-server --model ../models/DSV41-IQ2_XXS/...-00001-of-00010.gguf --ctx 16
 - 两个程序按 GGUF 的架构名自动选引擎（`bl::open_chat`）。分词用 libllama（架构名不认识时用只有元数据的临时副本加载词表，
   `joyai-llm` 预分词器），模板照 GGUF 里的 `tokenizer.chat_template` 写成 C++；思考模式照 deepseek-recipe：开头一行
   `Reasoning Effort: N`，生成提示以 `<｜Assistant｜><think>` 结尾（`tests/test_dsv41_template.cpp` 逐字节对照官方编码）。
-  没有工具调用（模板里没有）。
+  工具调用：OpenAI 的 `tools` 写成官方的工具提示词，助手的调用是 DSML 块（`<｜DSML｜ calls>` / `invoke` / `parameter`，
+  `string="true|false"` 区分字符串和 JSON），工具结果是 `<tool_result>…</tool_result>`；带工具时历史里的思考内容保留。
+  bl-server 把生成里的 DSML 块解析回 `tool_calls`（流式时截在 `<｜DSML｜ calls>` 前）。
 - 默认混合解码（`BL_DSV41_HYBRID=1`）；启动时按 `bench/dsv41/expert_profile.txt` 把最常用的专家装进 VRAM 和 RAM 层，约 35 s
   （`BL_DSV41_PROFILE=none` 跳过）。
 - 速度（3090 + 64 GB）：新内容 9–12 tok/s，重复性的输出约 20 tok/s；prefill 1K 提示词约 25 tok/s、4K 约 74 tok/s（YOCO 截断：后 20 层只跑最后 128 个 token，见 [LOG.md](LOG.md) 2026-10-20）。
