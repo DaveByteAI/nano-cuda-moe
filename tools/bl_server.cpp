@@ -222,6 +222,7 @@ int main(int argc, char ** argv) {
     const bool fixed_name = !name.empty();
     std::mutex state_mu;   // guards the switch state below and the model's name (read without waiting for `busy`)
     std::string current, target, state = "ready", switch_error, family;
+    int model_ctx = 0;     // the loaded model's context (a model may run with less than --ctx)
     std::atomic<bool> switching{false};
     auto model_name = [&] { std::lock_guard<std::mutex> lk(state_mu); return name; };
     auto load = [&](const std::string & path) {   // the old one goes first: two do not fit
@@ -232,6 +233,7 @@ int main(int argc, char ** argv) {
         std::lock_guard<std::mutex> lk(state_mu);
         current = model_id(path);
         family = cur.chat->family();
+        model_ctx = cur.chat->max_ctx();
         if (!fixed_name) {
             name = cur.chat->family() + "-" + current;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
@@ -265,7 +267,7 @@ int main(int argc, char ** argv) {
         json list = json::array();
         for (const auto & m : list_models(model)) list.push_back({{"id", m.id}, {"gb", std::round(m.gb * 10) / 10}});
         std::lock_guard<std::mutex> lk(state_mu);
-        res.set_content(json{{"current", current}, {"family", family}, {"state", state}, {"target", target}, {"error", switch_error}, {"ctx", ctx}, {"models", list}}.dump(),
+        res.set_content(json{{"current", current}, {"family", family}, {"state", state}, {"target", target}, {"error", switch_error}, {"ctx", model_ctx ? model_ctx : ctx}, {"models", list}}.dump(),
                         "application/json");
     });
     srv.Post("/bl/models", [&](const httplib::Request & req, httplib::Response & res) {

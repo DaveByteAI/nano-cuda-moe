@@ -32,11 +32,12 @@ std::string architecture(const std::string & path) {
 
 class QwenChat : public ChatModel {
 public:
-    QwenChat(const std::string & path, int ctx, const std::string & cache) : text_(path), eng_(path, ctx, cache), chat_(eng_, text_, ctx) {}
+    QwenChat(const std::string & path, int ctx, const std::string & cache) : text_(path), eng_(path, ctx, cache), chat_(eng_, text_, ctx), ctx_(ctx) {}
     ChatResult reply(const std::vector<Text::Message> & m, const ChatParams & p,
                      const std::function<bool(const std::string &, bool)> & on_text) override { return chat_.reply(m, p, on_text); }
     void        reset() override { chat_.reset(); }
     int         position() const override { return chat_.position(); }
+    int         max_ctx() const override { return ctx_; }
     std::string report() const override { return eng_.report(); }
     std::string family() const override { return "qwen3.8-flash"; }
     void        save_cache(const std::string & f) override { eng_.save_cache(f); }
@@ -44,6 +45,7 @@ private:
     Text   text_;
     Engine eng_;
     Chat   chat_;
+    int    ctx_;
 };
 
 class Dsv41Chat : public ChatModel {
@@ -74,6 +76,7 @@ public:
     }
     void        reset() override { eng_.reset(); session_.clear(); pending_ = -1; }
     int         position() const override { return eng_.position() + (pending_ >= 0 ? 1 : 0); }
+    int         max_ctx() const override { return max_ctx_; }
     std::string report() const override { return eng_.report(); }
     std::string family() const override { return "deepseek-v4.1-flash"; }
     std::string tool_call_tag() const override { return "<｜DSML｜ calls>"; }

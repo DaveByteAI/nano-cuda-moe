@@ -54,7 +54,7 @@ int main(int argc, char ** argv) {
             if (line.rfind("/think", 0) == 0) { const std::string m = line.size() > 7 ? line.substr(7) : "off"; cp.think = m == "off" ? "" : m; std::printf("(thinking: %s)\n", m.c_str()); continue; }
             if (line.rfind("/temp", 0) == 0) { cp.sampling.temperature = std::stof(line.substr(5)); std::printf("(temperature %.2f)\n", cp.sampling.temperature); continue; }
             if (line == "/stats") {
-                std::printf("context %d / %d tokens\n%s\n", chat->position(), ctx, chat->report().c_str());
+                std::printf("context %d / %d tokens\n%s\n", chat->position(), chat->max_ctx(), chat->report().c_str());
                 continue;
             }
             msgs.push_back({"user", line, ""});

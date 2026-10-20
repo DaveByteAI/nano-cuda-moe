@@ -55,6 +55,7 @@ public:
                              const std::function<bool(const std::string &, bool)> & on_text = nullptr) = 0;
     virtual void        reset() = 0;
     virtual int         position() const = 0;
+    virtual int         max_ctx() const = 0;            // the context it runs with (open_chat may cut what was asked)
     virtual std::string report() const = 0;
     virtual std::string family() const = 0;           // a model name prefix: "qwen3.8-flash", "deepseek-v4.1-flash"
     virtual bool        tools() const { return true; } // function calling through the template
