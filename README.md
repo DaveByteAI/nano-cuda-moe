@@ -223,7 +223,8 @@ DeepInfer does (YOCO). `bl-dsv41 --tokens-file F --force 64
 
 - **2-bit experts.** IQ2_XXS is what makes 140 GB of experts possible here; answers are below the official model's.
 - **Long context costs VRAM.** The compressed KV is kept in fp32, ~6.4 KB per token taken from the expert cache
-  (32K: 0.2 GB, 128K: 0.84 GB); a 20K-token prompt finds a fact from its first line. A 20K prompt takes ~4 minutes.
+  (32K: 0.2 GB, 128K: 0.84 GB). A 64K-token prompt takes ~10 minutes, recalls a fact from its first line and one from
+  its middle, and the tokens after it come ~20% slower than after a 4K one.
 - **No speculative decoding.** The model's own draft (DSpark, 3 layers, not in this GGUF) is packed from the official
   weights by `bl-dspark-pack` and guesses well (3.25 of 5 tokens accepted), but checking 6 tokens at once touches
   ~21 different experts per layer instead of 6 and costs 8.5 single steps here. It pays off only when the model fits in

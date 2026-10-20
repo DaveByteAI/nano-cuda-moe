@@ -199,7 +199,9 @@ int main(int argc, char ** argv) {
         }
         if (use_prefill) {
             std::vector<float> all;
+            const auto pa = std::chrono::steady_clock::now();
             const auto & l = eng.prefill(prompt, lg.is_open() ? &all : nullptr);
+            std::printf("prefill %zu tokens: %.1f s\n", prompt.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - pa).count());
             if (lg.is_open()) lg.write(reinterpret_cast<const char *>(all.data()), all.size() * 4);
             const auto t = top(l, 5);
             std::printf("prefill %zu tokens -> top5", prompt.size());

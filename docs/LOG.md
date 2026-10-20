@@ -828,3 +828,7 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
   密码是 7391-2846"。prefill 230 s（90 tok/s，第 20 层起 14 s）。
 - 显存：压缩 KV + indexer key 每 token 约 6.4 KB（fp32），32K 0.2 GB、128K 0.84 GB，从专家缓存里扣。bl-chat / bl-server
   不再把上下文压到 16K（默认 32K）。
+- 64K（`--ctx 65536`）：仓库文档和源码拼成 63486 token，第一行藏密码、正中间藏会议室编号，最后两个一起问：答"1. 7391-2846
+  2. B 座 1407 会议室"。prefill 588 s（108 tok/s：按 4096 一块读专家，块越多摊得越薄；indexer 的平方项在 64K 还不是大头）。
+  decode（`--gen 160 --stats-after 64`，没有预热专家）：170 ms/token，同条件 4K 对照 139；命中率 63.7% vs 74.3%（长 prefill 后
+  缓存冷），两者分不开。`bl-dsv41 --prefill` 现在打印 prefill 耗时。
