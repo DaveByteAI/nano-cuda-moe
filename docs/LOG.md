@@ -788,3 +788,13 @@ cuBLAS 约 1.1 s、专家约 1.1 s、GDN 前处理 0.24 s、to_bf16 0.22 s。
 - 顺带发现：Engram 表的页缓存被挤掉时，4096 token 的 prefill 光读 Engram 行就要 43 s（热的时候 0.2 s），单次测量的方差主要来自这里。
 - `bl-dsv41 --prefill` 的 bug：判断要不要存 logits 用的是没打开的 `ofstream` 的布尔值（总是 true），每次都申请全位置 logits
   （4096 token 是 2.1 GB，直接 OOM），截断也不会生效。改成 `is_open()`；`--force` 也能 `--save-logits` 了（逐步的 logits）。
+
+## 2026-10-20 dsv41：思考模式的提示词对齐官方编码（deepseek-recipe）
+
+- DeepSeek 同时开源了 deepseek-recipe（官方 API 的提示词编码，Rust + Python，PyPI `deepseek-recipe`）。拿它的
+  `DeepseekV41Encoding.render_conversation` 对照：非思考模式和我们逐字节一致；思考模式官方在第一条消息前多一行
+  `<｜System｜>Reasoning Effort: N (range 1-100, the higher the value, the more thorough the reasoning)\n\n`
+  （low 50，max 100，其余 75；第一条是 system 时它的内容直接接在后面，不再写 `<｜System｜>`），我们原来没有。
+- `render_dsv41` 改为接收 effort（`ChatParams::think`），移到 `bl` 命名空间以便测试；`tests/test_dsv41_template.cpp`：
+  6 组对话 × 5 种 effort 共 30 个用例，期望值由 deepseek-recipe 0.2.0 生成，全部逐字节一致。
+- 端到端：`bl-chat --think xhigh` 问"17 乘以 23"，思考后答 391，思考和正文分开正常。

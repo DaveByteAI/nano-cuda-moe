@@ -45,27 +45,6 @@ private:
     Chat   chat_;
 };
 
-// tokenizer.chat_template of the deepseek41 GGUF ("checked against the exact release's encoding.py"): BOS, system as
-// <｜System｜>, a user turn as <｜User｜> (consecutive ones joined by a blank line), an assistant turn as its text and
-// <｜end▁of▁sentence｜>; after a user turn (or a later system one) that the assistant answers: <｜Assistant｜></think>.
-// Thinking (not in that template, the release's thinking mode): the generation prompt ends <｜Assistant｜><think> instead.
-std::string render_dsv41(const std::vector<Text::Message> & msgs, bool think) {
-    std::string s = "<｜begin▁of▁sentence｜>";
-    for (size_t i = 0; i < msgs.size(); ++i) {
-        const Text::Message & m = msgs[i];
-        const std::string role = m.role == "developer" ? "system" : m.role;
-        if (!m.tool_calls.empty()) throw std::runtime_error("this model's template has no tool calls");
-        if (role == "system") s += "<｜System｜>" + m.content;
-        else if (role == "user") s += (i > 0 && msgs[i - 1].role == "user" ? "\n\n" : "<｜User｜>") + m.content;
-        else if (role == "assistant") s += m.content + "<｜end▁of▁sentence｜>";
-        else throw std::runtime_error("this model's template takes system, user and assistant messages (got " + m.role + ")");
-        const bool last = i + 1 == msgs.size();
-        if ((last || msgs[i + 1].role == "assistant") && (role == "user" || (role == "system" && i > 0)))
-            s += last && think ? "<｜Assistant｜><think>" : "<｜Assistant｜></think>";
-    }
-    return s;
-}
-
 class Dsv41Chat : public ChatModel {
 public:
     Dsv41Chat(const std::string & path, int ctx) : text_(path), max_ctx_(ctx), eng_((setenv("BL_DSV41_HYBRID", "1", 0), path), ctx) {
@@ -104,7 +83,7 @@ public:
         if (!p.tools.empty()) throw std::runtime_error("this model's template has no tool calls");
         ChatResult res;
         const bool think = !p.think.empty();
-        const std::string rendered = render_dsv41(messages, think);
+        const std::string rendered = render_dsv41(messages, p.think);
         // the session's text a prefix of the new conversation: feed the rest (after the pending token); else start over
         std::string suffix;
         if (!session_.empty() && rendered.size() > session_.size() && rendered.compare(0, session_.size(), session_) == 0) {
@@ -202,6 +181,33 @@ private:
 };
 
 }  // namespace
+
+// tokenizer.chat_template of the deepseek41 GGUF ("checked against the exact release's encoding.py"): BOS, system as
+// <｜System｜>, a user turn as <｜User｜> (consecutive ones joined by a blank line), an assistant turn as its text and
+// <｜end▁of▁sentence｜>; after a user turn (or a later system one) that the assistant answers: <｜Assistant｜></think>.
+// Thinking (not in that template, the release's thinking mode, as deepseek-recipe's DeepseekV41Encoding renders it):
+// the first message is preceded by <｜System｜>Reasoning Effort: N ...\n\n (low 50, max 100, else 75; a leading system
+// message's text follows it without a second <｜System｜>), and the generation prompt ends <｜Assistant｜><think>.
+std::string render_dsv41(const std::vector<Text::Message> & msgs, const std::string & think_effort) {
+    const bool think = !think_effort.empty();
+    std::string s = "<｜begin▁of▁sentence｜>";
+    if (think)
+        s += "<｜System｜>Reasoning Effort: " + std::string(think_effort == "low" ? "50" : think_effort == "max" ? "100" : "75") +
+             " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    for (size_t i = 0; i < msgs.size(); ++i) {
+        const Text::Message & m = msgs[i];
+        const std::string role = m.role == "developer" ? "system" : m.role;
+        if (!m.tool_calls.empty()) throw std::runtime_error("this model's template has no tool calls");
+        if (role == "system") s += (i == 0 && think ? "" : "<｜System｜>") + m.content;
+        else if (role == "user") s += (i > 0 && msgs[i - 1].role == "user" ? "\n\n" : "<｜User｜>") + m.content;
+        else if (role == "assistant") s += m.content + "<｜end▁of▁sentence｜>";
+        else throw std::runtime_error("this model's template takes system, user and assistant messages (got " + m.role + ")");
+        const bool last = i + 1 == msgs.size();
+        if ((last || msgs[i + 1].role == "assistant") && (role == "user" || (role == "system" && i > 0)))
+            s += last && think ? "<｜Assistant｜><think>" : "<｜Assistant｜></think>";
+    }
+    return s;
+}
 
 std::unique_ptr<ChatModel> open_chat(const std::string & shard1, int max_ctx, const std::string & cache_file) {
     if (architecture(shard1) == "deepseek41") return std::make_unique<Dsv41Chat>(shard1, max_ctx);

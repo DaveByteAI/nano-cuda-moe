@@ -62,5 +62,7 @@ public:
 };
 // cache_file: the qwen3.8 engine's --expert-cache (ignored by the others)
 std::unique_ptr<ChatModel> open_chat(const std::string & shard1, int max_ctx, const std::string & cache_file = "");
+// the deepseek41 prompt of a conversation (think_effort: ChatParams::think), with the generation prompt
+std::string render_dsv41(const std::vector<Text::Message> & msgs, const std::string & think_effort);
 
 }  // namespace bl
