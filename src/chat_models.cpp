@@ -210,7 +210,16 @@ std::string render_dsv41(const std::vector<Text::Message> & msgs, const std::str
 }
 
 std::unique_ptr<ChatModel> open_chat(const std::string & shard1, int max_ctx, const std::string & cache_file) {
-    if (architecture(shard1) == "deepseek41") return std::make_unique<Dsv41Chat>(shard1, max_ctx);
+    if (architecture(shard1) == "deepseek41") {
+        // the engine stops at 16K (the two-level candidate selection is not implemented): the programs' default 32K
+        // context, made for qwen3.8, is cut to that instead of refusing to start
+        constexpr int kDsv41MaxCtx = 16384;
+        if (max_ctx > kDsv41MaxCtx) {
+            std::fprintf(stderr, "dsv41: context %d -> %d (the engine's limit)\n", max_ctx, kDsv41MaxCtx);
+            max_ctx = kDsv41MaxCtx;
+        }
+        return std::make_unique<Dsv41Chat>(shard1, max_ctx);
+    }
     return std::make_unique<QwenChat>(shard1, max_ctx, cache_file);
 }
 
