@@ -202,17 +202,26 @@ json error_json(const std::string & msg, const std::string & type = "invalid_req
 int main(int argc, char ** argv) {
     std::string model, host = "127.0.0.1", name, web, cache_file;   // name: from the model's id unless given
     int port = 8080, ctx = 32768;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
-        if (a == "--model") model = next();
-        else if (a == "--host") host = next();
-        else if (a == "--port") port = std::stoi(next());
-        else if (a == "--ctx") ctx = bl::parse_ctx(next());
-        else if (a == "--name") name = next();
-        else if (a == "--web") web = next();   // the chat page's directory (default: ../web next to the executable)
-        else if (a == "--expert-cache") cache_file = next();
-        else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string a = argv[i];
+            auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+            if (a == "--model") model = next();
+            else if (a == "--host") host = next();
+            else if (a == "--port") {
+                const std::string v = next();
+                try { port = std::stoi(v); } catch (...) { throw std::runtime_error("--port " + v + ": expected a port number"); }
+                if (port < 1 || port > 65535) throw std::runtime_error("--port " + v + ": out of range (1-65535)");
+            }
+            else if (a == "--ctx") ctx = bl::parse_ctx(next());
+            else if (a == "--name") name = next();
+            else if (a == "--web") web = next();   // the chat page's directory (default: ../web next to the executable)
+            else if (a == "--expert-cache") cache_file = next();
+            else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
+        }
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "bl-server: %s\n", e.what());
+        return 2;
     }
     if (model.empty()) { std::fprintf(stderr, "usage: %s --model SHARD1.gguf [--host H] [--port P] [--ctx N]\n", argv[0]); return 2; }
 
@@ -239,7 +248,12 @@ int main(int argc, char ** argv) {
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
         }
     };
-    load(model);
+    try {
+        load(model);
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "bl-server: cannot load %s: %s\n", model.c_str(), e.what());
+        return 1;
+    }
     auto save_cache = [&] {   // after a reply (under `busy`): the next start begins with this cache
         if (cache_file.empty() || !cur.chat) return;
         try { cur.chat->save_cache(cache_file); } catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); }
