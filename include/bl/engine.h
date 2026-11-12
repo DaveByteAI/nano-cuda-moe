@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -30,12 +31,22 @@ struct Sampling {
 
 // a context length as the tools take it: tokens, or with a k suffix (x 1024): "32768", "64k", "128k", "256k"
 inline int parse_ctx(const std::string & s) {
+    const auto bad = [&] { return std::invalid_argument("--ctx " + s + ": a number of tokens, or with k (64k, 128k, 256k)"); };
     size_t n = 0;
-    const long v = std::stol(s, &n);
+    long v = 0;
+    try {
+        v = std::stol(s, &n);   // throws "stol" on a non-number; report what was expected instead
+    } catch (...) {
+        throw bad();
+    }
+    if (v < 1) throw bad();
     const std::string rest = s.substr(n);
     if (rest.empty()) return static_cast<int>(v);
-    if (rest == "k" || rest == "K") return static_cast<int>(v * 1024);
-    throw std::invalid_argument("--ctx " + s + ": a number of tokens, or with k (64k, 128k, 256k)");
+    if (rest == "k" || rest == "K") {
+        if (v > std::numeric_limits<int>::max() / 1024) throw bad();
+        return static_cast<int>(v * 1024);
+    }
+    throw bad();
 }
 
 class Engine {
